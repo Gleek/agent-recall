@@ -80,6 +80,16 @@
   :group 'tools
   :prefix "agent-recall-")
 
+(defface agent-recall-header-key
+  '((t :inherit warning :weight bold))
+  "Face for keybinding letters in the transcript header line."
+  :group 'agent-recall)
+
+(defface agent-recall-header-label
+  '((t :inherit default))
+  "Face for labels in the transcript header line."
+  :group 'agent-recall)
+
 (defcustom agent-recall-search-paths (list (expand-file-name "~"))
   "Root directories to scan when rebuilding the transcript index.
 Used only by `agent-recall-reindex'.  Each directory is recursively
@@ -557,6 +567,25 @@ plain markdown buffer you can render with your preferred method."
     map)
   "Keymap for `agent-recall-transcript-mode'.")
 
+(defun agent-recall--header-entry (key label)
+  "Format a header line entry with KEY highlighted and LABEL dimmed."
+  (concat (propertize key 'face 'agent-recall-header-key)
+          " "
+          (propertize label 'face 'agent-recall-header-label)))
+
+(defun agent-recall--header-line (&optional session-id)
+  "Build the header line string for transcript mode.
+When SESSION-ID is non-nil, include a resume entry."
+  (let ((entries (list)))
+    (when session-id
+      (push (agent-recall--header-entry
+             "r" (format "Resume (%s)" (substring session-id 0 8)))
+            entries))
+    (push (agent-recall--header-entry "c" "Clean") entries)
+    (push (agent-recall--header-entry "C-j/C-k" "Navigate") entries)
+    (push (agent-recall--header-entry "q" "Quit") entries)
+    (concat "  " (mapconcat #'identity (nreverse entries) "  "))))
+
 (define-minor-mode agent-recall-transcript-mode
   "Minor mode for viewing agent-recall transcripts.
 When the transcript has a resumable session ID, press `r' to resume."
@@ -577,12 +606,11 @@ When the transcript has a resumable session ID, press `r' to resume."
           (evil-local-set-key 'normal (kbd "gj") #'agent-recall-next-user-message)
           (evil-local-set-key 'normal (kbd "gk") #'agent-recall-prev-user-message)
           (evil-local-set-key 'normal (kbd "q") #'quit-window))
-        (if session-id
-            (message "Session resumable (%s) — press `r' to resume, `q' to quit"
-                     (substring session-id 0 8))
-          (message "Transcript opened (no session ID) — press `q' to quit")))
+        (setq-local header-line-format
+                    (agent-recall--header-line session-id)))
     (read-only-mode -1)
-    (kill-local-variable 'agent-recall--transcript-session-id)))
+    (kill-local-variable 'agent-recall--transcript-session-id)
+    (kill-local-variable 'header-line-format)))
 
 (defun agent-recall-resume-current ()
   "Resume the agent-shell session associated with the current transcript."

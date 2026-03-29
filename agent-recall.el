@@ -479,9 +479,81 @@ loaded, offers to resume the session."
         (goto-char (point-min))
         (agent-recall-transcript-mode)))))
 
+(defun agent-recall-clean-view ()
+  "Open a clean view of the current transcript.
+Creates a new buffer with only User and Agent messages, stripping
+tool calls, agent thoughts, and other noise.  The result is a
+plain markdown buffer you can render with your preferred method."
+  (interactive)
+  (let ((source-file (buffer-file-name))
+        (source-buffer (current-buffer)))
+    (unless source-file
+      (user-error "Buffer is not visiting a file"))
+    (let* ((base (file-name-sans-extension
+                  (file-name-nondirectory source-file)))
+           (temp (expand-file-name (concat base "-clean.md")
+                                   temporary-file-directory))
+           (buf (find-file-noselect temp)))
+      (with-current-buffer buf
+        (let ((inhibit-read-only t))
+          (erase-buffer)
+          (with-current-buffer source-buffer
+            (save-excursion
+              (goto-char (point-min))
+              ;; Copy the header (everything before first ## heading)
+              (let ((header-end (or (re-search-forward "^## " nil t)
+                                    (point-max))))
+                (with-current-buffer buf
+                  (insert-buffer-substring source-buffer 1 header-end)))
+              (goto-char (point-min))
+              ;; Extract User and Agent sections, stopping at tool calls
+              (while (re-search-forward "^## \\(User\\|Agent\\) " nil t)
+                (let* ((section-start (match-beginning 0))
+                       (section-end
+                        (save-excursion
+                          (goto-char (match-end 0))
+                          ;; Stop at next ## heading or ### Tool Call, whichever comes first
+                          (if (re-search-forward "^\\(## \\|### Tool Call\\)" nil t)
+                              (match-beginning 0)
+                            (point-max))))
+                       (text (buffer-substring-no-properties
+                              section-start section-end)))
+                  (with-current-buffer buf
+                    (insert text))
+                  (goto-char section-end)))))
+          (goto-char (point-min))
+          (save-buffer)
+          (when (fboundp 'markdown-mode)
+            (markdown-mode))
+          (set-buffer-modified-p nil)))
+      (pop-to-buffer buf))))
+
+(defun agent-recall-next-user-message ()
+  "Jump to the next user message in the transcript."
+  (interactive)
+  (let ((pos (save-excursion
+               (end-of-line)
+               (re-search-forward "^## User" nil t))))
+    (if pos
+        (goto-char (match-beginning 0))
+      (message "No more user messages"))))
+
+(defun agent-recall-prev-user-message ()
+  "Jump to the previous user message in the transcript."
+  (interactive)
+  (let ((pos (save-excursion
+               (beginning-of-line)
+               (re-search-backward "^## User" nil t))))
+    (if pos
+        (goto-char pos)
+      (message "No earlier user messages"))))
+
 (defvar agent-recall-transcript-mode-map
   (let ((map (make-sparse-keymap)))
     (define-key map (kbd "r") #'agent-recall-resume-current)
+    (define-key map (kbd "c") #'agent-recall-clean-view)
+    (define-key map (kbd "C-c C-n") #'agent-recall-next-user-message)
+    (define-key map (kbd "C-c C-p") #'agent-recall-prev-user-message)
     map)
   "Keymap for `agent-recall-transcript-mode'.")
 
@@ -497,6 +569,13 @@ When the transcript has a resumable session ID, press `r' to resume."
         ;; Evil-compatible keybinding
         (when (bound-and-true-p evil-mode)
           (evil-local-set-key 'normal (kbd "r") #'agent-recall-resume-current)
+          (evil-local-set-key 'normal (kbd "c") #'agent-recall-clean-view)
+          (evil-local-set-key 'normal (kbd "C-j") #'agent-recall-next-user-message)
+          (evil-local-set-key 'normal (kbd "C-k") #'agent-recall-prev-user-message)
+          (evil-local-set-key 'normal (kbd "]]") #'agent-recall-next-user-message)
+          (evil-local-set-key 'normal (kbd "[[") #'agent-recall-prev-user-message)
+          (evil-local-set-key 'normal (kbd "gj") #'agent-recall-next-user-message)
+          (evil-local-set-key 'normal (kbd "gk") #'agent-recall-prev-user-message)
           (evil-local-set-key 'normal (kbd "q") #'quit-window))
         (if session-id
             (message "Session resumable (%s) — press `r' to resume, `q' to quit"

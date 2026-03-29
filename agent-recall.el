@@ -2,7 +2,7 @@
 
 ;; Author: Marcos Andrade
 ;; URL: https://github.com/Marx-A00/agent-recall
-;; Version: 0.2.0
+;; Version: 0.3.0
 ;; Package-Requires: ((emacs "28.1"))
 ;; Keywords: tools, convenience, ai
 
@@ -34,14 +34,17 @@
 ;; but there's no built-in way to search across them or resume past
 ;; conversations.
 ;;
-;; agent-recall discovers all transcript directories, indexes them,
+;; agent-recall maintains a persistent index of all transcripts,
 ;; provides fast full-text search powered by ripgrep, and can resume
-;; past agent-shell sessions from any transcript.
+;; past agent-shell sessions from any transcript.  The index grows
+;; automatically as you use agent-shell (via a mode hook) and can
+;; be rebuilt from scratch with `agent-recall-reindex'.
 ;;
 ;; Quick start:
 ;;
-;;   ;; Set where your projects live (defaults to home directory)
+;;   ;; First-time setup: build the index
 ;;   (setq agent-recall-search-paths '("~/projects" "~/work"))
+;;   M-x agent-recall-reindex
 ;;
 ;;   ;; Search all transcripts
 ;;   M-x agent-recall-search
@@ -78,16 +81,17 @@
   :prefix "agent-recall-")
 
 (defcustom agent-recall-search-paths (list (expand-file-name "~"))
-  "Root directories to scan for agent-shell transcripts.
-Each directory is recursively searched for `.agent-shell/transcripts/'
-subdirectories up to `agent-recall-max-depth' levels deep."
+  "Root directories to scan when rebuilding the transcript index.
+Used only by `agent-recall-reindex'.  Each directory is recursively
+searched for `.agent-shell/transcripts/' subdirectories up to
+`agent-recall-max-depth' levels deep."
   :type '(repeat directory)
   :group 'agent-recall)
 
 (defcustom agent-recall-max-depth 6
   "Maximum directory depth when scanning for transcript directories.
-Increase if your projects are deeply nested.  Lower values speed up
-directory discovery."
+Used only by `agent-recall-reindex'.  Increase if your projects are
+deeply nested.  Lower values speed up the reindex scan."
   :type 'integer
   :group 'agent-recall)
 
@@ -119,11 +123,15 @@ Passed as -C to ripgrep."
   :type 'integer
   :group 'agent-recall)
 
-(defcustom agent-recall-cache-ttl 300
-  "Seconds before the discovered directories cache expires.
-Set to 0 to disable caching.  Use `agent-recall-invalidate-cache'
-to manually clear."
-  :type 'integer
+(defcustom agent-recall-index-file
+  (expand-file-name "index.el" (expand-file-name ".agent-recall" (getenv "HOME")))
+  "Path to the persistent transcript index file.
+The index stores metadata (file paths, project names, timestamps,
+session IDs, and previews) for all known transcripts.  It is updated
+automatically when new agent-shell sessions are created (via the
+`agent-recall-track-sessions' hook) and can be rebuilt from scratch
+with `agent-recall-reindex'."
+  :type 'file
   :group 'agent-recall)
 
 (defcustom agent-recall-browse-sort 'date-desc
@@ -155,11 +163,13 @@ Increase this if matching fails due to slow initialization."
 
 ;;;; Internal State
 
-(defvar agent-recall--dir-cache nil
-  "Cached list of discovered transcript directories.")
+(defvar agent-recall--index nil
+  "In-memory hash-table of indexed transcripts.
+Keys are absolute file paths, values are plists
+\(:project :dir :timestamp :session-id :preview).")
 
-(defvar agent-recall--dir-cache-time nil
-  "Timestamp when `agent-recall--dir-cache' was last populated.")
+(defvar agent-recall--index-loaded-p nil
+  "Non-nil if the index has been loaded from disk this Emacs session.")
 
 (defvar agent-recall--symlink-dir nil
   "Path to temporary symlink directory for multi-dir search backends.")
@@ -174,36 +184,93 @@ Values are session ID strings, or the symbol `none' for unresolvable.")
 (defvar-local agent-recall--session-id-written-p nil
   "Non-nil if session ID has already been written to this buffer's transcript.")
 
-;;;; Directory Discovery
+;;;; Persistent Index
 
-(defun agent-recall--cache-valid-p ()
-  "Return non-nil if the directory cache is still valid."
-  (and agent-recall--dir-cache
-       agent-recall--dir-cache-time
-       (> agent-recall-cache-ttl 0)
-       (< (float-time (time-subtract nil agent-recall--dir-cache-time))
-          agent-recall-cache-ttl)))
+(defun agent-recall--index-load ()
+  "Read the index file from disk into `agent-recall--index'.
+Sets `agent-recall--index-loaded-p' on success.  If the file is
+missing or corrupt, sets an empty hash-table."
+  (let ((file agent-recall-index-file))
+    (if (file-exists-p file)
+        (condition-case err
+            (with-temp-buffer
+              (insert-file-contents file)
+              (let ((data (read (current-buffer))))
+                (if (hash-table-p data)
+                    (setq agent-recall--index data)
+                  (setq agent-recall--index (make-hash-table :test 'equal))
+                  (message "agent-recall: index file corrupt, starting fresh"))))
+          (error
+           (setq agent-recall--index (make-hash-table :test 'equal))
+           (message "agent-recall: failed to load index: %s" (error-message-string err))))
+      (setq agent-recall--index (make-hash-table :test 'equal)))
+    (setq agent-recall--index-loaded-p t)))
 
-(defun agent-recall--discover-dirs (&optional force-refresh)
-  "Discover all transcript directories under `agent-recall-search-paths'.
-Uses cached results unless FORCE-REFRESH is non-nil or the cache has
-expired (see `agent-recall-cache-ttl')."
-  (if (and (not force-refresh) (agent-recall--cache-valid-p))
-      agent-recall--dir-cache
-    (let ((dirs '()))
-      (dolist (root agent-recall-search-paths)
-        (when (file-directory-p root)
-          (let* ((cmd (format "find %s -maxdepth %d -path '*/%s' -type d 2>/dev/null"
-                              (shell-quote-argument (expand-file-name root))
-                              agent-recall-max-depth
-                              agent-recall-transcript-dir-name))
-                 (output (shell-command-to-string cmd))
-                 (found (split-string output "\n" t)))
-            (setq dirs (append dirs found)))))
-      (setq dirs (delete-dups dirs))
-      (setq agent-recall--dir-cache dirs
-            agent-recall--dir-cache-time (current-time))
-      dirs)))
+(defun agent-recall--index-save ()
+  "Write `agent-recall--index' to disk atomically.
+Writes to a temporary file then renames to `agent-recall-index-file'."
+  (when agent-recall--index
+    (let* ((file agent-recall-index-file)
+           (dir (file-name-directory file)))
+      (unless (file-directory-p dir)
+        (make-directory dir t))
+      (let ((temp (make-temp-file (expand-file-name ".index-" dir))))
+      (with-temp-file temp
+        (insert ";; agent-recall transcript index -*- no-byte-compile: t -*-\n")
+        (insert (format ";; Generated: %s\n\n" (format-time-string "%F %T")))
+        (let ((print-level nil)
+              (print-length nil))
+          (prin1 agent-recall--index (current-buffer)))
+        (insert "\n"))
+      (rename-file temp file t)))))
+
+(defun agent-recall--index-add (file &optional session-id)
+  "Add transcript FILE to the index with optional SESSION-ID.
+Derives project name, directory, and timestamp from the file path.
+Extracts a preview from the file content.  Saves the index to disk."
+  (agent-recall--index-ensure)
+  (let* ((dir (file-name-directory file))
+         (project (agent-recall--project-name dir))
+         (basename (file-name-sans-extension (file-name-nondirectory file)))
+         (preview (when (file-exists-p file)
+                    (agent-recall--transcript-preview file))))
+    (puthash file
+             (list :project project
+                   :dir (directory-file-name dir)
+                   :timestamp basename
+                   :session-id session-id
+                   :preview (or preview "(empty)"))
+             agent-recall--index)
+    (agent-recall--index-save)))
+
+(defun agent-recall--index-ensure ()
+  "Ensure the index is loaded into memory.
+Loads from disk if not yet loaded this session.  If no index file
+exists, sets an empty hash-table and notifies the user."
+  (unless agent-recall--index-loaded-p
+    (agent-recall--index-load)
+    (when (zerop (hash-table-count agent-recall--index))
+      (unless (file-exists-p agent-recall-index-file)
+        (message "No transcript index found.  Run M-x agent-recall-reindex to build one.")))))
+
+(defun agent-recall--index-dirs ()
+  "Return a deduplicated list of transcript directories from the index."
+  (agent-recall--index-ensure)
+  (let ((dirs (make-hash-table :test 'equal)))
+    (maphash (lambda (_file entry)
+               (puthash (plist-get entry :dir) t dirs))
+             agent-recall--index)
+    (hash-table-keys dirs)))
+
+(defun agent-recall--index-files ()
+  "Return all indexed transcript file paths, skipping non-existent files."
+  (agent-recall--index-ensure)
+  (let ((files '()))
+    (maphash (lambda (file _entry)
+               (when (file-exists-p file)
+                 (push file files)))
+             agent-recall--index)
+    (nreverse files)))
 
 (defun agent-recall--project-name (transcript-dir)
   "Extract the project name from TRANSCRIPT-DIR.
@@ -228,13 +295,59 @@ returns `/path/to/project'."
 
 ;;;###autoload
 (defun agent-recall-invalidate-cache ()
-  "Clear the transcript directory and session ID caches.
-The next search or browse command will re-scan the filesystem."
+  "Clear in-memory caches, forcing a reload from the index file.
+Does not delete the persistent index; the next command will
+re-read it from disk."
   (interactive)
-  (setq agent-recall--dir-cache nil
-        agent-recall--dir-cache-time nil)
+  (setq agent-recall--index-loaded-p nil
+        agent-recall--index nil)
   (clrhash agent-recall--session-id-cache)
-  (message "agent-recall: all caches cleared"))
+  (message "agent-recall: caches cleared (index will reload from disk)"))
+
+;;;###autoload
+(defun agent-recall-reindex ()
+  "Rebuild the transcript index by scanning `agent-recall-search-paths'.
+This is the only command that crawls the filesystem.  Run it once
+after installing agent-recall, or to pick up transcripts created
+outside of agent-shell sessions tracked by the hook."
+  (interactive)
+  (let ((dirs '())
+        (new-index (make-hash-table :test 'equal))
+        (file-count 0)
+        (project-count 0))
+    ;; Discover transcript directories (same find logic as before)
+    (dolist (root agent-recall-search-paths)
+      (when (file-directory-p root)
+        (let* ((cmd (format "find %s -maxdepth %d -path '*/%s' -type d 2>/dev/null"
+                            (shell-quote-argument (expand-file-name root))
+                            agent-recall-max-depth
+                            agent-recall-transcript-dir-name))
+               (output (shell-command-to-string cmd))
+               (found (split-string output "\n" t)))
+          (setq dirs (append dirs found)))))
+    (setq dirs (delete-dups dirs))
+    (setq project-count (length dirs))
+    ;; Index every transcript file
+    (dolist (dir dirs)
+      (let ((project (agent-recall--project-name dir))
+            (files (directory-files dir t "\\.md\\'" t)))
+        (dolist (file files)
+          (let* ((basename (file-name-sans-extension (file-name-nondirectory file)))
+                 (preview (agent-recall--transcript-preview file))
+                 (session-id (agent-recall--resolve-session-id file)))
+            (puthash file
+                     (list :project project
+                           :dir (directory-file-name dir)
+                           :timestamp basename
+                           :session-id session-id
+                           :preview (or preview "(empty)"))
+                     new-index)
+            (cl-incf file-count)))))
+    (setq agent-recall--index new-index
+          agent-recall--index-loaded-p t)
+    (agent-recall--index-save)
+    (message "agent-recall: indexed %d transcripts across %d projects"
+             file-count project-count)))
 
 ;;;; Search — Core (grep buffer)
 
@@ -243,9 +356,9 @@ The next search or browse command will re-scan the filesystem."
   "Search all agent-shell transcripts for QUERY using ripgrep.
 Results appear in a grep-mode buffer with clickable file locations."
   (interactive "sSearch transcripts: ")
-  (let* ((dirs (agent-recall--discover-dirs)))
+  (let* ((dirs (agent-recall--index-dirs)))
     (unless dirs
-      (user-error "No transcript directories found.  Check `agent-recall-search-paths'"))
+      (user-error "No transcripts indexed.  Run M-x agent-recall-reindex"))
     (let* ((dir-args (mapconcat #'shell-quote-argument dirs " "))
            (extra (mapconcat #'identity agent-recall-search-extra-args " "))
            (cmd (format "%s --no-heading --line-number --color=auto --glob %s -C %d %s -- %s %s"
@@ -264,7 +377,7 @@ Results appear in a grep-mode buffer with clickable file locations."
 Returns the path.  Each symlink is named PROJECT-COUNT to avoid
 collisions when multiple projects share a name."
   (let* ((base (expand-file-name "agent-recall" temporary-file-directory))
-         (dirs (agent-recall--discover-dirs)))
+         (dirs (agent-recall--index-dirs)))
     (when (file-exists-p base)
       (delete-directory base t))
     (make-directory base t)
@@ -303,15 +416,15 @@ Uses `counsel-rg' if available, falling back to `agent-recall-search'."
 
 (defun agent-recall--list-transcripts ()
   "Return an alist of (DISPLAY-NAME . FILE-PATH) for all transcripts."
-  (let ((dirs (agent-recall--discover-dirs))
-        (transcripts '()))
-    (dolist (dir dirs)
-      (let* ((project (agent-recall--project-name dir))
-             (files (directory-files dir t "\\.md\\'" t)))
-        (dolist (file files)
-          (let* ((basename (file-name-sans-extension (file-name-nondirectory file)))
-                 (display (format "[%s] %s" project basename)))
-            (push (cons display file) transcripts)))))
+  (agent-recall--index-ensure)
+  (let ((transcripts '()))
+    (maphash (lambda (file entry)
+               (when (file-exists-p file)
+                 (let* ((project (plist-get entry :project))
+                        (ts (plist-get entry :timestamp))
+                        (display (format "[%s] %s" project ts)))
+                   (push (cons display file) transcripts))))
+             agent-recall--index)
     (pcase agent-recall-browse-sort
       ('date-desc (sort transcripts (lambda (a b) (string> (car a) (car b)))))
       ('date-asc  (sort transcripts (lambda (a b) (string< (car a) (car b)))))
@@ -336,16 +449,23 @@ loaded, offers to resume the session."
   (interactive)
   (let* ((transcripts (agent-recall--list-transcripts)))
     (unless transcripts
-      (user-error "No transcripts found.  Check `agent-recall-search-paths'"))
-    (let* ((selection (completing-read
+      (user-error "No transcripts indexed.  Run M-x agent-recall-reindex"))
+    (let* ((previews (make-hash-table :test 'equal))
+           (_ (maphash (lambda (_file entry)
+                         (let* ((project (plist-get entry :project))
+                                (ts (plist-get entry :timestamp))
+                                (display (format "[%s] %s" project ts)))
+                           (puthash display (or (plist-get entry :preview) "") previews)))
+                       agent-recall--index))
+           (selection (completing-read
                        "Transcript: "
                        (lambda (string pred action)
                          (if (eq action 'metadata)
                              `(metadata
                                (annotation-function
                                 . ,(lambda (candidate)
-                                     (when-let ((file (cdr (assoc candidate transcripts))))
-                                       (let ((preview (agent-recall--transcript-preview file)))
+                                     (let ((preview (gethash candidate previews)))
+                                       (when (and preview (not (string-empty-p preview)))
                                          (concat "  " preview))))))
                            (complete-with-action
                             action (mapcar #'car transcripts) string pred)))
@@ -371,10 +491,14 @@ When the transcript has a resumable session ID, press `r' to resume."
       (let ((session-id (agent-recall--resolve-session-id (buffer-file-name))))
         (setq-local agent-recall--transcript-session-id session-id)
         (read-only-mode 1)
+        ;; Evil-compatible keybinding
+        (when (bound-and-true-p evil-mode)
+          (evil-local-set-key 'normal (kbd "r") #'agent-recall-resume-current)
+          (evil-local-set-key 'normal (kbd "q") #'quit-window))
         (if session-id
-            (message "Session resumable (%s) — press `r' to resume"
+            (message "Session resumable (%s) — press `r' to resume, `q' to quit"
                      (substring session-id 0 8))
-          (message "Transcript opened (no session ID — not resumable)")))
+          (message "Transcript opened (no session ID) — press `q' to quit")))
     (read-only-mode -1)
     (kill-local-variable 'agent-recall--transcript-session-id)))
 
@@ -433,13 +557,19 @@ Only shows transcripts that have resolvable session IDs."
   (interactive)
   (unless (fboundp 'agent-shell--start)
     (user-error "agent-shell is not loaded; cannot resume sessions"))
-  (let* ((transcripts (agent-recall--list-transcripts))
-         (resumable '()))
-    (dolist (entry transcripts)
-      (let* ((file (cdr entry))
-             (session-id (agent-recall--resolve-session-id file)))
-        (when session-id
-          (push (cons (car entry) (cons file session-id)) resumable))))
+  (agent-recall--index-ensure)
+  (let ((resumable '()))
+    (maphash (lambda (file entry)
+               (when (file-exists-p file)
+                 (let ((session-id (or (plist-get entry :session-id)
+                                       (agent-recall--resolve-session-id file))))
+                   (when session-id
+                     (let* ((project (plist-get entry :project))
+                            (ts (plist-get entry :timestamp))
+                            (preview (or (plist-get entry :preview) ""))
+                            (display (format "[%s] %s" project ts)))
+                       (push (list display file session-id preview) resumable))))))
+             agent-recall--index)
     (unless resumable
       (user-error "No resumable transcripts found.  Try `agent-recall-backfill' first"))
     (let* ((selection (completing-read
@@ -450,15 +580,15 @@ Only shows transcripts that have resolvable session IDs."
                                (annotation-function
                                 . ,(lambda (candidate)
                                      (when-let ((entry (assoc candidate resumable)))
-                                       (let* ((file (cadr entry))
-                                              (preview (agent-recall--transcript-preview file)))
-                                         (concat "  " preview))))))
+                                       (let ((preview (nth 3 entry)))
+                                         (when (and preview (not (string-empty-p preview)))
+                                           (concat "  " preview)))))))
                            (complete-with-action
                             action (mapcar #'car resumable) string pred)))
                        nil t))
            (entry (assoc selection resumable))
-           (file (cadr entry))
-           (session-id (cddr entry)))
+           (file (nth 1 entry))
+           (session-id (nth 2 entry)))
       (when session-id
         (agent-recall--start-resume session-id file)))))
 
@@ -468,23 +598,26 @@ Only shows transcripts that have resolvable session IDs."
 (defun agent-recall-stats ()
   "Display statistics about your agent-shell transcript collection."
   (interactive)
-  (let* ((dirs (agent-recall--discover-dirs t))
-         (total-files 0)
-         (total-size 0)
-         (project-stats '()))
-    (dolist (dir dirs)
-      (let* ((project (agent-recall--project-name dir))
-             (files (directory-files dir t "\\.md\\'" t))
-             (count (length files))
-             (size (cl-reduce #'+ (mapcar (lambda (f)
-                                            (or (file-attribute-size
-                                                 (file-attributes f))
-                                                0))
-                                          files)
-                              :initial-value 0)))
-        (cl-incf total-files count)
-        (cl-incf total-size size)
-        (push (list project count size) project-stats)))
+  (agent-recall--index-ensure)
+  (let ((total-files 0)
+        (total-size 0)
+        (project-data (make-hash-table :test 'equal))
+        (project-stats '()))
+    ;; Group files by project, compute sizes
+    (maphash (lambda (file entry)
+               (when (file-exists-p file)
+                 (let* ((project (plist-get entry :project))
+                        (size (or (file-attribute-size (file-attributes file)) 0))
+                        (cur (gethash project project-data (list 0 0))))
+                   (puthash project
+                            (list (1+ (nth 0 cur)) (+ (nth 1 cur) size))
+                            project-data)
+                   (cl-incf total-files)
+                   (cl-incf total-size size))))
+             agent-recall--index)
+    (maphash (lambda (project counts)
+               (push (list project (nth 0 counts) (nth 1 counts)) project-stats))
+             project-data)
     (setq project-stats
           (sort project-stats (lambda (a b) (> (nth 1 a) (nth 1 b)))))
     (with-current-buffer (get-buffer-create "*agent-recall-stats*")
@@ -494,7 +627,7 @@ Only shows transcripts that have resolvable session IDs."
                             'face 'info-title-1))
         (insert (make-string 40 ?═) "\n\n")
         (insert (format "  Transcripts: %d\n" total-files))
-        (insert (format "  Projects:    %d\n" (length dirs)))
+        (insert (format "  Projects:    %d\n" (hash-table-count project-data)))
         (insert (format "  Total size:  %.1f MB\n\n" (/ total-size 1048576.0)))
         (insert (propertize "By Project:\n" 'face 'bold))
         (insert (make-string 40 ?─) "\n")
@@ -567,6 +700,9 @@ Add to your config:
                                      agent-shell--transcript-file
                                      (file-exists-p agent-shell--transcript-file))
                             (agent-recall--write-session-id-to-file
+                             agent-shell--transcript-file
+                             agent-recall--pending-session-id)
+                            (agent-recall--index-add
                              agent-shell--transcript-file
                              agent-recall--pending-session-id)
                             (setq-local agent-recall--session-id-written-p t)
@@ -766,8 +902,8 @@ session IDs into transcript file headers.
 
 Results are displayed in the `*agent-recall-backfill*' buffer."
   (interactive "P")
+  (agent-recall--index-ensure)
   (let* ((actually-write write-mode)
-         (dirs (agent-recall--discover-dirs t))
          (matched 0)
          (skipped 0)
          (no-match 0)
@@ -782,58 +918,59 @@ Results are displayed in the `*agent-recall-backfill*' buffer."
                    "Agent Recall — Backfill (DRY RUN)\n")
                  'face 'info-title-1))
         (insert (make-string 50 ?═) "\n\n")
-        (dolist (dir dirs)
-          (let* ((project (agent-recall--project-name dir))
-                 (files (directory-files dir t "\\.md\\'" t)))
-            (dolist (file files)
-              (cl-incf total)
-              (let ((existing (agent-recall--read-embedded-session-id file)))
-                (cond
-                 ;; Already has session ID
-                 (existing
-                  (cl-incf skipped)
-                  (insert (format "  SKIP:     [%s] %s (has %s)\n"
-                                  project
-                                  (file-name-nondirectory file)
-                                  (substring existing 0 8))))
-                 ;; Try to match
-                 (t
-                  (let* ((transcript-dir (agent-recall--transcript-dir-from-file file))
-                         (project-root (agent-recall--project-root transcript-dir))
-                         (claude-dir (agent-recall--claude-project-dir project-root))
-                         (transcript-time (agent-recall--parse-transcript-timestamp file))
-                         (session-id nil)
-                         (delta nil))
-                    ;; Resolve session ID with delta tracking
-                    (when (and claude-dir transcript-time)
-                      (let ((all-sessions
-                             (append
-                              (agent-recall--load-sessions-index claude-dir)
-                              (agent-recall--scan-jsonl-timestamps claude-dir))))
-                        (setq all-sessions (delete-dups all-sessions))
-                        (dolist (entry all-sessions)
-                          (let ((d (float-time
-                                    (time-subtract (cdr entry) transcript-time))))
-                            (when (and (>= d 0)
-                                       (<= d agent-recall-session-match-window)
-                                       (or (null delta) (< d delta)))
-                              (setq session-id (car entry)
-                                    delta d))))))
-                    (if session-id
-                        (progn
-                          (cl-incf matched)
-                          (insert (format "  MATCH:    [%s] %s → %s (Δ%.0fs)\n"
-                                          project
-                                          (file-name-nondirectory file)
-                                          (substring session-id 0 8)
-                                          delta))
-                          (when actually-write
-                            (agent-recall--write-session-id-to-file file session-id)
-                            (push file modified-files)))
-                      (cl-incf no-match)
-                      (insert (format "  NO MATCH: [%s] %s\n"
-                                      project
-                                      (file-name-nondirectory file)))))))))))
+        (maphash
+         (lambda (file entry)
+           (when (file-exists-p file)
+             (let ((project (plist-get entry :project)))
+               (cl-incf total)
+               (let ((existing (agent-recall--read-embedded-session-id file)))
+                 (cond
+                  ;; Already has session ID
+                  (existing
+                   (cl-incf skipped)
+                   (insert (format "  SKIP:     [%s] %s (has %s)\n"
+                                   project
+                                   (file-name-nondirectory file)
+                                   (substring existing 0 8))))
+                  ;; Try to match
+                  (t
+                   (let* ((transcript-dir (agent-recall--transcript-dir-from-file file))
+                          (project-root (agent-recall--project-root transcript-dir))
+                          (claude-dir (agent-recall--claude-project-dir project-root))
+                          (transcript-time (agent-recall--parse-transcript-timestamp file))
+                          (session-id nil)
+                          (delta nil))
+                     ;; Resolve session ID with delta tracking
+                     (when (and claude-dir transcript-time)
+                       (let ((all-sessions
+                              (append
+                               (agent-recall--load-sessions-index claude-dir)
+                               (agent-recall--scan-jsonl-timestamps claude-dir))))
+                         (setq all-sessions (delete-dups all-sessions))
+                         (dolist (entry all-sessions)
+                           (let ((d (float-time
+                                     (time-subtract (cdr entry) transcript-time))))
+                             (when (and (>= d 0)
+                                        (<= d agent-recall-session-match-window)
+                                        (or (null delta) (< d delta)))
+                               (setq session-id (car entry)
+                                     delta d))))))
+                     (if session-id
+                         (progn
+                           (cl-incf matched)
+                           (insert (format "  MATCH:    [%s] %s → %s (Δ%.0fs)\n"
+                                           project
+                                           (file-name-nondirectory file)
+                                           (substring session-id 0 8)
+                                           delta))
+                           (when actually-write
+                             (agent-recall--write-session-id-to-file file session-id)
+                             (push file modified-files)))
+                       (cl-incf no-match)
+                       (insert (format "  NO MATCH: [%s] %s\n"
+                                       project
+                                       (file-name-nondirectory file)))))))))))
+         agent-recall--index)
         ;; Summary
         (insert "\n" (make-string 50 ?─) "\n")
         (insert (propertize "Summary:\n" 'face 'bold))

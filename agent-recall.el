@@ -531,7 +531,6 @@ When TRANSCRIPT-FILE is provided, sets working directory from the transcript."
   (let* ((default-directory (or (and transcript-file
                                      (agent-recall--read-working-directory transcript-file))
                                 default-directory))
-         (agent-shell-session-strategy 'new)
          (config (or (and (fboundp 'agent-shell--resolve-preferred-config)
                           (agent-shell--resolve-preferred-config))
                      (and (fboundp 'agent-shell-select-config)
@@ -539,6 +538,7 @@ When TRANSCRIPT-FILE is provided, sets working directory from the transcript."
                      (error "No agent config found")))
          (shell-buffer (agent-shell--start :config config
                                            :session-id session-id
+                                           :session-strategy 'new
                                            :no-focus t
                                            :new-session t)))
     (if (derived-mode-p 'agent-shell-mode 'agent-shell-viewport-view-mode

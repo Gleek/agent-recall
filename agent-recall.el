@@ -413,8 +413,9 @@ Uses `counsel-rg' if available, falling back to `agent-recall-search'."
    ((fboundp 'counsel-rg)
     (let* ((dir (agent-recall--ensure-symlink-dir))
            (counsel-rg-base-command
-            (format "rg --max-columns 240 --with-filename --no-heading --line-number --color never --follow --glob %s %%s"
-                    (shell-quote-argument agent-recall-file-pattern))))
+            (list "rg" "--max-columns" "240" "--with-filename"
+                  "--no-heading" "--line-number" "--color" "never"
+                  "--follow" "--glob" agent-recall-file-pattern "%s")))
       (counsel-rg nil dir "" "Recall: ")))
    ((fboundp 'consult-ripgrep)
     (let ((dir (agent-recall--ensure-symlink-dir)))

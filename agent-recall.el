@@ -133,6 +133,25 @@ Passed as -C to ripgrep."
   :type 'integer
   :group 'agent-recall)
 
+(defcustom agent-recall-search-function 'grep
+  "Search backend used by `agent-recall-search'.
+Determines how search results are displayed.
+
+Possible values:
+  `grep'             - built-in grep-mode (default, always available)
+  `deadgrep'         - deadgrep buffer (requires `deadgrep' package)
+  `counsel-rg'       - ivy/counsel live search (requires `counsel')
+  `consult-ripgrep'  - vertico/consult live search (requires `consult')
+
+Each backend receives the search query and the list of indexed
+transcript directories.  If the chosen backend is not installed,
+falls back to `grep'."
+  :type '(choice (const :tag "grep-mode (built-in)" grep)
+                 (const :tag "deadgrep" deadgrep)
+                 (const :tag "counsel-rg (ivy)" counsel-rg)
+                 (const :tag "consult-ripgrep (vertico)" consult-ripgrep))
+  :group 'agent-recall)
+
 (defcustom agent-recall-index-file
   (expand-file-name "index.el" (expand-file-name ".agent-recall" (getenv "HOME")))
   "Path to the persistent transcript index file.
@@ -359,34 +378,14 @@ outside of agent-shell sessions tracked by the hook."
     (message "agent-recall: indexed %d transcripts across %d projects"
              file-count project-count)))
 
-;;;; Search — Core (grep buffer)
-
-;;;###autoload
-(defun agent-recall-search (query)
-  "Search all agent-shell transcripts for QUERY using ripgrep.
-Results appear in a grep-mode buffer with clickable file locations."
-  (interactive "sSearch transcripts: ")
-  (let* ((dirs (agent-recall--index-dirs)))
-    (unless dirs
-      (user-error "No transcripts indexed.  Run M-x agent-recall-reindex"))
-    (let* ((dir-args (mapconcat #'shell-quote-argument dirs " "))
-           (extra (mapconcat #'identity agent-recall-search-extra-args " "))
-           (cmd (format "%s --no-heading --line-number --color=auto --glob %s -C %d %s -- %s %s"
-                        (shell-quote-argument agent-recall-rg-executable)
-                        (shell-quote-argument agent-recall-file-pattern)
-                        agent-recall-search-context-lines
-                        extra
-                        (shell-quote-argument query)
-                        dir-args)))
-      (grep cmd))))
-
-;;;; Search — Live (counsel / consult integration)
+;;;; Search
 
 (defun agent-recall--ensure-symlink-dir ()
-  "Create a temporary directory with symlinks to all transcript dirs.
+  "Create a directory with symlinks to all transcript dirs.
 Returns the path.  Each symlink is named PROJECT-COUNT to avoid
-collisions when multiple projects share a name."
-  (let* ((base (expand-file-name "agent-recall" temporary-file-directory))
+collisions when multiple projects share a name.
+The directory lives under `~/.agent-recall/search/'."
+  (let* ((base (expand-file-name "search" (file-name-directory agent-recall-index-file)))
          (dirs (agent-recall--index-dirs)))
     (when (file-exists-p base)
       (delete-directory base t))
@@ -404,24 +403,80 @@ collisions when multiple projects share a name."
     (setq agent-recall--symlink-dir base)
     base))
 
+(defun agent-recall--search-via-grep (query dirs)
+  "Search DIRS for QUERY using ripgrep with results in `grep-mode'."
+  (let* ((dir-args (mapconcat #'shell-quote-argument dirs " "))
+         (extra (mapconcat #'identity agent-recall-search-extra-args " "))
+         (cmd (format "%s --no-heading --line-number --color=auto --glob %s -C %d %s -- %s %s"
+                      (shell-quote-argument agent-recall-rg-executable)
+                      (shell-quote-argument agent-recall-file-pattern)
+                      agent-recall-search-context-lines
+                      extra
+                      (shell-quote-argument query)
+                      dir-args)))
+    (grep cmd)))
+
+(defun agent-recall--search-via-deadgrep (query _dirs)
+  "Search transcripts for QUERY using `deadgrep'.
+DIRS are unused; deadgrep searches the symlink directory instead."
+  (unless (fboundp 'deadgrep)
+    (user-error "deadgrep is not installed.  Install it or set `agent-recall-search-function' to `grep'"))
+  (let ((dir (agent-recall--ensure-symlink-dir))
+        (deadgrep-extra-arguments (append deadgrep-extra-arguments '("--follow"))))
+    (deadgrep query dir)))
+
+(defun agent-recall--search-via-counsel-rg (query _dirs)
+  "Search transcripts for QUERY using `counsel-rg'.
+DIRS are unused; counsel-rg searches the symlink directory instead."
+  (unless (fboundp 'counsel-rg)
+    (user-error "counsel is not installed.  Install it or set `agent-recall-search-function' to `grep'"))
+  (let* ((dir (agent-recall--ensure-symlink-dir))
+         (counsel-rg-base-command
+          (list "rg" "--max-columns" "240" "--with-filename"
+                "--no-heading" "--line-number" "--color" "never"
+                "--follow" "--glob" agent-recall-file-pattern "%s")))
+    (counsel-rg query dir "" "Recall: ")))
+
+(defun agent-recall--search-via-consult-ripgrep (_query _dirs)
+  "Search transcripts using `consult-ripgrep'.
+QUERY and DIRS are unused; consult-ripgrep prompts interactively."
+  (unless (fboundp 'consult-ripgrep)
+    (user-error "consult is not installed.  Install it or set `agent-recall-search-function' to `grep'"))
+  (let ((dir (agent-recall--ensure-symlink-dir)))
+    (consult-ripgrep dir)))
+
+;;;###autoload
+(defun agent-recall-search (query)
+  "Search all agent-shell transcripts for QUERY.
+The search backend is controlled by `agent-recall-search-function'."
+  (interactive "sSearch transcripts: ")
+  (let ((dirs (agent-recall--index-dirs)))
+    (unless dirs
+      (user-error "No transcripts indexed.  Run M-x agent-recall-reindex"))
+    (pcase agent-recall-search-function
+      ('deadgrep         (agent-recall--search-via-deadgrep query dirs))
+      ('counsel-rg       (agent-recall--search-via-counsel-rg query dirs))
+      ('consult-ripgrep  (agent-recall--search-via-consult-ripgrep query dirs))
+      (_                 (agent-recall--search-via-grep query dirs)))))
+
 ;;;###autoload
 (defun agent-recall-search-live ()
   "Search transcripts with live-updating results.
-Uses `counsel-rg' if available, falling back to `agent-recall-search'."
+Uses `agent-recall-search-function' if it supports live search,
+otherwise falls back to the best available live backend."
   (interactive)
-  (cond
-   ((fboundp 'counsel-rg)
-    (let* ((dir (agent-recall--ensure-symlink-dir))
-           (counsel-rg-base-command
-            (list "rg" "--max-columns" "240" "--with-filename"
-                  "--no-heading" "--line-number" "--color" "never"
-                  "--follow" "--glob" agent-recall-file-pattern "%s")))
-      (counsel-rg nil dir "" "Recall: ")))
-   ((fboundp 'consult-ripgrep)
-    (let ((dir (agent-recall--ensure-symlink-dir)))
-      (consult-ripgrep dir)))
-   (t
-    (call-interactively #'agent-recall-search))))
+  (let ((dirs (agent-recall--index-dirs)))
+    (unless dirs
+      (user-error "No transcripts indexed.  Run M-x agent-recall-reindex"))
+    (pcase agent-recall-search-function
+      ('counsel-rg       (agent-recall--search-via-counsel-rg "" dirs))
+      ('consult-ripgrep  (agent-recall--search-via-consult-ripgrep "" dirs))
+      ;; deadgrep and grep don't do live filtering — pick best available
+      (_
+       (cond
+        ((fboundp 'counsel-rg)      (agent-recall--search-via-counsel-rg "" dirs))
+        ((fboundp 'consult-ripgrep) (agent-recall--search-via-consult-ripgrep "" dirs))
+        (t                          (call-interactively #'agent-recall-search)))))))
 
 ;;;; Browse
 
@@ -612,6 +667,20 @@ When the transcript has a resumable session ID, press `r' to resume."
     (read-only-mode -1)
     (kill-local-variable 'agent-recall--transcript-session-id)
     (kill-local-variable 'header-line-format)))
+
+(defun agent-recall--transcript-file-p (file)
+  "Return non-nil if FILE is inside an agent-shell transcript directory.
+Also matches files opened via the agent-recall search symlink directory."
+  (and file
+       (or (string-match-p "/\\.agent-shell/transcripts/" file)
+           (string-match-p "/\\.agent-recall/search/" file))))
+
+(defun agent-recall--maybe-enable-transcript-mode ()
+  "Enable `agent-recall-transcript-mode' if visiting a transcript file."
+  (when (agent-recall--transcript-file-p (buffer-file-name))
+    (agent-recall-transcript-mode 1)))
+
+(add-hook 'find-file-hook #'agent-recall--maybe-enable-transcript-mode)
 
 (defun agent-recall-resume-current ()
   "Resume the agent-shell session associated with the current transcript."

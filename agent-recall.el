@@ -3,7 +3,7 @@
 ;; Author: Marcos Andrade
 ;; URL: https://github.com/Marx-A00/agent-recall
 ;; Version: 0.3.0
-;; Package-Requires: ((emacs "28.1"))
+;; Package-Requires: ((emacs "28.1") (agent-shell "0.1.0"))
 ;; Keywords: tools, convenience, ai
 
 ;; This file is NOT part of GNU Emacs.
@@ -69,6 +69,7 @@
 
 ;;; Code:
 
+(require 'agent-shell)
 (require 'cl-lib)
 (require 'grep)
 (require 'json)
@@ -711,10 +712,8 @@ When TRANSCRIPT-FILE is provided, sets working directory from the transcript."
   (let* ((default-directory (or (and transcript-file
                                      (agent-recall--read-working-directory transcript-file))
                                 default-directory))
-         (config (or (and (fboundp 'agent-shell--resolve-preferred-config)
-                          (agent-shell--resolve-preferred-config))
-                     (and (fboundp 'agent-shell-select-config)
-                          (agent-shell-select-config :prompt "Resume with agent: "))
+         (config (or (agent-shell--resolve-preferred-config)
+                     (agent-shell-select-config :prompt "Resume with agent: ")
                      (error "No agent config found")))
          (shell-buffer (agent-shell--start :config config
                                            :session-id session-id
@@ -735,8 +734,6 @@ When TRANSCRIPT-FILE is provided, sets working directory from the transcript."
   "Resume a past agent-shell session from a transcript.
 Only shows transcripts that have resolvable session IDs."
   (interactive)
-  (unless (fboundp 'agent-shell--start)
-    (user-error "agent-shell is not loaded; cannot resume sessions"))
   (agent-recall--index-ensure)
   (let ((resumable '()))
     (maphash (lambda (file entry)
@@ -848,50 +845,47 @@ resume from `agent-recall-browse' and `agent-recall-resume'.
 
 Add to your config:
   (add-hook \\='agent-shell-mode-hook #\\='agent-recall-track-sessions)"
-  (when (fboundp 'agent-shell-subscribe-to)
-    (let ((shell-buffer (current-buffer)))
-      ;; Subscribe to init-session to capture the session ID
-      (agent-shell-subscribe-to
-       :shell-buffer shell-buffer
-       :event 'init-session
-       :on-event
-       (lambda (_event)
-         (when-let ((session-id
-                     (and (buffer-live-p shell-buffer)
-                          (buffer-local-value 'agent-shell--state shell-buffer)
-                          (map-nested-elt
-                           (buffer-local-value 'agent-shell--state shell-buffer)
-                           '(:session :id)))))
-           (with-current-buffer shell-buffer
-             (setq-local agent-recall--pending-session-id session-id)
-             ;; Subscribe to turn-complete to write after first prompt
-             ;; (transcript file is guaranteed to exist by then)
-             (let ((write-token nil))
-               (setq write-token
-                     (agent-shell-subscribe-to
-                      :shell-buffer shell-buffer
-                      :event 'turn-complete
-                      :on-event
-                      (lambda (_event)
-                        (with-current-buffer shell-buffer
-                          (when (and agent-recall--pending-session-id
-                                     (not agent-recall--session-id-written-p)
-                                     (boundp 'agent-shell--transcript-file)
-                                     agent-shell--transcript-file
-                                     (file-exists-p agent-shell--transcript-file))
-                            (agent-recall--write-session-id-to-file
-                             agent-shell--transcript-file
-                             agent-recall--pending-session-id)
-                            (agent-recall--index-add
-                             agent-shell--transcript-file
-                             agent-recall--pending-session-id)
-                            (setq-local agent-recall--session-id-written-p t)
-                            (setq-local agent-recall--pending-session-id nil))
-                          ;; Unsubscribe after first successful write
-                          (when (and write-token agent-recall--session-id-written-p
-                                     (fboundp 'agent-shell-unsubscribe))
-                            (agent-shell-unsubscribe
-                             :subscription write-token))))))))))))))
+  (let ((shell-buffer (current-buffer)))
+    ;; Subscribe to init-session to capture the session ID
+    (agent-shell-subscribe-to
+     :shell-buffer shell-buffer
+     :event 'init-session
+     :on-event
+     (lambda (_event)
+       (when-let ((session-id
+                   (and (buffer-live-p shell-buffer)
+                        (buffer-local-value 'agent-shell--state shell-buffer)
+                        (map-nested-elt
+                         (buffer-local-value 'agent-shell--state shell-buffer)
+                         '(:session :id)))))
+         (with-current-buffer shell-buffer
+           (setq-local agent-recall--pending-session-id session-id)
+           ;; Subscribe to turn-complete to write after first prompt
+           ;; (transcript file is guaranteed to exist by then)
+           (let ((write-token nil))
+             (setq write-token
+                   (agent-shell-subscribe-to
+                    :shell-buffer shell-buffer
+                    :event 'turn-complete
+                    :on-event
+                    (lambda (_event)
+                      (with-current-buffer shell-buffer
+                        (when (and agent-recall--pending-session-id
+                                   (not agent-recall--session-id-written-p)
+                                   agent-shell--transcript-file
+                                   (file-exists-p agent-shell--transcript-file))
+                          (agent-recall--write-session-id-to-file
+                           agent-shell--transcript-file
+                           agent-recall--pending-session-id)
+                          (agent-recall--index-add
+                           agent-shell--transcript-file
+                           agent-recall--pending-session-id)
+                          (setq-local agent-recall--session-id-written-p t)
+                          (setq-local agent-recall--pending-session-id nil))
+                        ;; Unsubscribe after first successful write
+                        (when (and write-token agent-recall--session-id-written-p)
+                          (agent-shell-unsubscribe
+                           :subscription write-token)))))))))))))
 
 ;;; ====================================================================
 ;;; Part B: Retroactive Session Matching

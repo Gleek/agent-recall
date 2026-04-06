@@ -158,7 +158,10 @@ falls back to `grep'."
   :group 'agent-recall)
 
 (defcustom agent-recall-index-file
-  (expand-file-name "index.el" (expand-file-name ".agent-recall" (getenv "HOME")))
+  (expand-file-name "agent-recall/index.el"
+                    (if (boundp 'no-littering-var-directory)
+                        no-littering-var-directory
+                      user-emacs-directory))
   "Path to the persistent transcript index file.
 The index stores metadata (file paths, project names, timestamps,
 session IDs, and previews) for all known transcripts.  It is updated
@@ -383,8 +386,17 @@ outside of agent-shell sessions tracked by the hook."
     (setq agent-recall--index new-index
           agent-recall--index-loaded-p t)
     (agent-recall--index-save)
-    (message "agent-recall: indexed %d transcripts across %d projects"
-             file-count project-count)))
+    (let ((without-session 0))
+      (maphash (lambda (_file props)
+                 (unless (plist-get props :session-id)
+                   (cl-incf without-session)))
+               new-index)
+      (message "agent-recall: indexed %d transcripts across %d projects%s"
+               file-count project-count
+               (if (> without-session 0)
+                   (format " (%d without session IDs — run M-x agent-recall-backfill to enable resume)"
+                           without-session)
+                 "")))))
 
 ;;;; Search
 
@@ -412,14 +424,12 @@ The directory lives under `~/.agent-recall/search/'."
     base))
 
 (defun agent-recall--search-via-grep (query dirs)
-  "Search DIRS for QUERY using ripgrep with results in `grep-mode'."
+  "Search DIRS for QUERY using grep with results in `grep-mode'.
+Falls back to standard grep, available on all systems."
   (let* ((dir-args (mapconcat #'shell-quote-argument dirs " "))
-         (extra (mapconcat #'identity agent-recall-search-extra-args " "))
-         (cmd (format "%s --no-heading --line-number --color=auto --glob %s -C %d %s -- %s %s"
-                      (shell-quote-argument agent-recall-rg-executable)
-                      (shell-quote-argument agent-recall-file-pattern)
+         (cmd (format "grep -rnH -C %d --include=%s -- %s %s"
                       agent-recall-search-context-lines
-                      extra
+                      (shell-quote-argument agent-recall-file-pattern)
                       (shell-quote-argument query)
                       dir-args)))
     (grep cmd)))
@@ -1231,7 +1241,8 @@ Results are displayed in the `*agent-recall-backfill*' buffer."
         (when (and actually-write modified-files)
           (insert (format "\n  Wrote session IDs to %d files.\n" (length modified-files)))
           ;; Write undo log
-          (let ((log-file (expand-file-name "~/.agent-recall-backfill-log.el")))
+          (let ((log-file (expand-file-name "backfill-log.el"
+                                            (file-name-directory agent-recall-index-file))))
             (with-temp-file log-file
               (insert ";; agent-recall backfill undo log\n")
               (insert (format ";; Written: %s\n" (format-time-string "%F %T")))

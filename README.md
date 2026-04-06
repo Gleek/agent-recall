@@ -1,0 +1,298 @@
+# Agent Recall
+
+Search, browse, and resume [agent-shell](https://github.com/xenodium/agent-shell) conversation transcripts.
+
+![agent-recall](agent-recall.png)
+
+## agent-recall
+
+[agent-shell](https://github.com/xenodium/agent-shell) automatically saves full conversation transcripts as Markdown files in `.agent-shell/transcripts/` within your projects. Over time these accumulate into a rich knowledge base of AI interactions, but there's no built-in way to search across them or resume past conversations.
+
+agent-recall maintains a persistent index of all transcripts, provides fast full-text search, and can resume past agent-shell sessions from any transcript.
+
+Features:
+
+- **Search** all transcripts with built-in grep (no external dependencies) or optional [ripgrep](https://github.com/BurntSushi/ripgrep) backends
+- **Live search** with real-time filtering via counsel-rg or consult-ripgrep
+- **Browse** transcripts by project and date with previews
+- **Resume** past agent-shell sessions directly from a transcript
+- **Track** session IDs automatically via hook
+- **Backfill** session IDs into old transcripts retroactively
+- **Stats** about your transcript collection
+
+## Setup
+
+### Dependencies
+
+- **agent-shell** — required for session resume and automatic session tracking. Search and browse work without it.
+- **ripgrep** (optional) — needed for the deadgrep, counsel-rg, and consult-ripgrep search backends. The default grep backend uses standard grep and requires no extra installation.
+
+### Installation
+
+agent-recall is a single-file package. Clone and add to your load path:
+
+```bash
+git clone https://github.com/Marx-A00/agent-recall.git ~/.emacs.d/agent-recall
+```
+
+```elisp
+(use-package agent-recall
+  :load-path "~/.emacs.d/agent-recall"
+  :commands (agent-recall-search
+             agent-recall-search-live
+             agent-recall-browse
+             agent-recall-resume
+             agent-recall-stats
+             agent-recall-reindex
+             agent-recall-backfill)
+  :config
+  (setq agent-recall-search-paths '("~/projects" "~/work")))
+```
+
+#### straight.el
+
+```elisp
+(use-package agent-recall
+  :straight (:host github :repo "Marx-A00/agent-recall")
+  :commands (agent-recall-search
+             agent-recall-search-live
+             agent-recall-browse
+             agent-recall-resume
+             agent-recall-stats
+             agent-recall-reindex
+             agent-recall-backfill)
+  :config
+  (setq agent-recall-search-paths '("~/projects" "~/work")))
+```
+
+#### Doom Emacs
+
+In `packages.el`:
+
+```elisp
+(package! agent-recall
+  :recipe (:host github :repo "Marx-A00/agent-recall"))
+```
+
+In `config.el`:
+
+```elisp
+(use-package! agent-recall
+  :commands (agent-recall-search
+             agent-recall-search-live
+             agent-recall-browse
+             agent-recall-resume
+             agent-recall-stats
+             agent-recall-reindex
+             agent-recall-backfill)
+  :config
+  (setq agent-recall-search-paths '("~/projects" "~/work")))
+```
+
+### Configuration
+
+#### Search paths
+
+Tell agent-recall where your projects live. These directories are scanned recursively for `.agent-shell/transcripts/` subdirectories:
+
+```elisp
+(setq agent-recall-search-paths '("~/projects" "~/work" "~/personal"))
+```
+
+#### Search backend
+
+Choose how search results are displayed. The default `grep` backend works everywhere with no extra dependencies; the others require [ripgrep](https://github.com/BurntSushi/ripgrep) and provide live-filtering:
+
+```elisp
+;; Built-in grep (default, no external dependencies)
+(setq agent-recall-search-function 'grep)
+
+;; deadgrep (requires ripgrep + deadgrep package)
+(setq agent-recall-search-function 'deadgrep)
+
+;; counsel-rg (requires ripgrep + ivy/counsel)
+(setq agent-recall-search-function 'counsel-rg)
+
+;; consult-ripgrep (requires ripgrep + vertico/consult)
+(setq agent-recall-search-function 'consult-ripgrep)
+```
+
+#### Session tracking
+
+To automatically embed session IDs in new transcripts (enabling instant resume):
+
+```elisp
+(add-hook 'agent-shell-mode-hook #'agent-recall-track-sessions)
+```
+
+#### Browse sort order
+
+```elisp
+;; Newest first (default)
+(setq agent-recall-browse-sort 'date-desc)
+
+;; Oldest first
+(setq agent-recall-browse-sort 'date-asc)
+
+;; Group by project
+(setq agent-recall-browse-sort 'project)
+```
+
+#### Full example
+
+```elisp
+(use-package agent-recall
+  :load-path "~/.emacs.d/agent-recall"
+  :hook (agent-shell-mode . agent-recall-track-sessions)
+  :commands (agent-recall-search
+             agent-recall-search-live
+             agent-recall-browse
+             agent-recall-resume
+             agent-recall-stats
+             agent-recall-reindex
+             agent-recall-backfill)
+  :config
+  (setq agent-recall-search-paths '("~/projects" "~/work")
+        agent-recall-search-function 'consult-ripgrep
+        agent-recall-browse-sort 'date-desc))
+```
+
+## Usage
+
+### Quick start
+
+```elisp
+;; 1. Set your search paths
+(setq agent-recall-search-paths '("~/projects"))
+
+;; 2. Build the index (one-time, scans filesystem)
+;; M-x agent-recall-reindex
+
+;; 3. Search, browse, or resume
+;; M-x agent-recall-search
+;; M-x agent-recall-browse
+;; M-x agent-recall-resume
+```
+
+### Searching transcripts
+
+`M-x agent-recall-search` prompts for a query and searches all indexed transcripts. The display depends on `agent-recall-search-function`.
+
+`M-x agent-recall-search-live` opens a live-filtering search. It auto-selects the best available backend (`counsel-rg` or `consult-ripgrep`); falls back to a one-shot search if neither is installed.
+
+### Browsing transcripts
+
+`M-x agent-recall-browse` shows a completion list of all transcripts in `[project] timestamp` format with preview annotations. Selecting a transcript opens it in `agent-recall-transcript-mode`.
+
+### Transcript mode
+
+When you open a transcript file (either via browse, search, or `C-x C-f`), `agent-recall-transcript-mode` activates automatically. The buffer becomes read-only and shows a header line with available actions.
+
+### Resuming sessions
+
+There are two ways to resume a past session:
+
+- Press `r` in transcript mode to resume that transcript's session
+- `M-x agent-recall-resume` to pick from all resumable transcripts
+
+Requires agent-shell to be loaded.
+
+### Backfilling session IDs
+
+If you have existing transcripts from before you set up session tracking, you can retroactively match them to sessions:
+
+```
+;; Dry-run (preview matches, no changes)
+M-x agent-recall-backfill
+
+;; Actually write session IDs to transcript headers
+C-u C-u M-x agent-recall-backfill
+```
+
+An undo log is saved alongside the index file so you can reverse the changes if needed.
+
+### Key bindings
+
+In `agent-recall-transcript-mode`:
+
+| Key | Command |
+|-----|---------|
+| `r` | Resume session (if session ID present) |
+| `c` | Open clean view (strip tool calls) |
+| `C-c C-n` | Jump to next user message |
+| `C-c C-p` | Jump to previous user message |
+| `q` | Quit window (evil) |
+
+#### Evil
+
+Evil users get additional bindings in normal state:
+
+| Key | Command |
+|-----|---------|
+| `]]` | Next user message |
+| `[[` | Previous user message |
+| `gj` | Next user message |
+| `gk` | Previous user message |
+| `C-j` | Next user message |
+| `C-k` | Previous user message |
+| `q` | Quit window |
+
+## Customizations
+
+| Custom variable | Description |
+|-----------------|-------------|
+| `agent-recall-search-paths` | Root directories to scan for transcripts |
+| `agent-recall-max-depth` | Maximum directory depth when scanning (default: 6) |
+| `agent-recall-transcript-dir-name` | Relative path identifying transcript dirs |
+| `agent-recall-file-pattern` | Glob pattern for transcript files (default: `*.md`) |
+| `agent-recall-rg-executable` | Path to ripgrep executable for rg-based backends (default: `rg`) |
+| `agent-recall-search-extra-args` | Extra arguments passed to ripgrep (rg-based backends only) |
+| `agent-recall-search-context-lines` | Context lines around search matches (default: 2) |
+| `agent-recall-search-function` | Search backend: grep, deadgrep, counsel-rg, consult-ripgrep |
+| `agent-recall-index-file` | Path to persistent index file |
+| `agent-recall-browse-sort` | Sort order: date-desc, date-asc, project |
+| `agent-recall-claude-config-dir` | Claude CLI config directory for session matching |
+| `agent-recall-session-match-window` | Max seconds for timestamp matching (default: 120) |
+
+## Commands
+
+| Command | Description |
+|---------|-------------|
+| `agent-recall-reindex` | Rebuild transcript index from filesystem |
+| `agent-recall-search` | Search all transcripts for a query |
+| `agent-recall-search-live` | Live-filtering search with auto backend selection |
+| `agent-recall-browse` | Browse transcripts by project with previews |
+| `agent-recall-resume` | Resume a past session (pick from all resumable) |
+| `agent-recall-resume-current` | Resume session from current transcript |
+| `agent-recall-clean-view` | Strip tool calls, show clean user/agent messages |
+| `agent-recall-next-user-message` | Jump to next user message in transcript |
+| `agent-recall-prev-user-message` | Jump to previous user message in transcript |
+| `agent-recall-stats` | Display transcript collection statistics |
+| `agent-recall-track-sessions` | Hook: auto-embed session IDs in new transcripts |
+| `agent-recall-backfill` | Retroactively match old transcripts to session IDs |
+| `agent-recall-invalidate-cache` | Clear in-memory caches |
+
+## How it works
+
+### Index
+
+agent-recall maintains a persistent index (default: `<user-emacs-directory>/agent-recall/index.el`, or under `no-littering-var-directory` if available). The index is a hash-table mapping file paths to metadata (project, timestamp, session ID, preview).
+
+The index is built by `agent-recall-reindex` (scans the filesystem) and grows automatically via the `agent-recall-track-sessions` hook.
+
+### Session ID resolution
+
+Session IDs are resolved in order:
+
+1. **Embedded header** — a `**Session:** UUID` line written by `agent-recall-track-sessions` or `agent-recall-backfill`
+2. **Retroactive matching** — compares the transcript's `**Started:**` timestamp against Claude session data in `~/.claude/projects/`, finding the closest session within `agent-recall-session-match-window` seconds
+
+Results are cached in memory for the duration of the Emacs session.
+
+### Search directory
+
+For search backends that need a single root directory (deadgrep, counsel-rg, consult-ripgrep), agent-recall creates a temporary symlink directory alongside the index file pointing to all indexed transcript directories.
+
+## Contributing
+
+Issues and pull requests welcome at https://github.com/Marx-A00/agent-recall.

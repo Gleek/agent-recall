@@ -38,13 +38,6 @@ git clone https://github.com/Marx-A00/agent-recall.git ~/.emacs.d/agent-recall
 ```elisp
 (use-package agent-recall
   :load-path "~/.emacs.d/agent-recall"
-  :commands (agent-recall-search
-             agent-recall-search-live
-             agent-recall-browse
-             agent-recall-resume
-             agent-recall-stats
-             agent-recall-reindex
-             agent-recall-backfill)
   :config
   (setq agent-recall-search-paths '("~/projects" "~/work")))
 ```
@@ -54,13 +47,6 @@ git clone https://github.com/Marx-A00/agent-recall.git ~/.emacs.d/agent-recall
 ```elisp
 (use-package agent-recall
   :straight (:host github :repo "Marx-A00/agent-recall")
-  :commands (agent-recall-search
-             agent-recall-search-live
-             agent-recall-browse
-             agent-recall-resume
-             agent-recall-stats
-             agent-recall-reindex
-             agent-recall-backfill)
   :config
   (setq agent-recall-search-paths '("~/projects" "~/work")))
 ```
@@ -78,13 +64,6 @@ In `config.el`:
 
 ```elisp
 (use-package! agent-recall
-  :commands (agent-recall-search
-             agent-recall-search-live
-             agent-recall-browse
-             agent-recall-resume
-             agent-recall-stats
-             agent-recall-reindex
-             agent-recall-backfill)
   :config
   (setq agent-recall-search-paths '("~/projects" "~/work")))
 ```
@@ -153,13 +132,6 @@ To automatically embed session IDs in new transcripts (enabling instant resume):
 (use-package agent-recall
   :load-path "~/.emacs.d/agent-recall"
   :hook (agent-shell-mode . agent-recall-track-sessions)
-  :commands (agent-recall-search
-             agent-recall-search-live
-             agent-recall-browse
-             agent-recall-resume
-             agent-recall-stats
-             agent-recall-reindex
-             agent-recall-backfill)
   :config
   (setq agent-recall-search-paths '("~/projects" "~/work")
         agent-recall-search-function 'consult-ripgrep
@@ -208,7 +180,13 @@ Requires agent-shell to be loaded.
 
 #### Transcript continuity
 
-When you resume a session, agent-recall appends new messages to the **original transcript file** rather than creating a new one. This keeps the full conversation history in a single file.
+When you resume a session, agent-recall defaults to appending new messages to the **original transcript file** rather than creating a new one. This keeps the full conversation history in a single file.
+
+If you would like to create new transcripts instead:
+
+```elisp
+(setq agent-recall-resume-continue-transcript nil)
+```
 
 #### Session load vs resume
 
@@ -220,6 +198,7 @@ agent-shell supports two ACP methods for resuming sessions:
 To get previous messages when resuming, set:
 
 ```elisp
+;; Note that this is an agent-shell variable, NOT a part of agent-recall
 (setq agent-shell-prefer-session-resume nil)
 ```
 
@@ -238,6 +217,8 @@ C-u C-u M-x agent-recall-backfill
 ```
 
 An undo log is saved alongside the index file so you can reverse the changes if needed.
+
+Note: In my experience, Claude chats get offloaded, so there's a good chance that older conversations won't be able to be matched.
 
 ### Key bindings
 
@@ -279,6 +260,7 @@ Evil users get additional bindings in normal state:
 | `agent-recall-search-function` | Search backend: grep, deadgrep, counsel-rg, consult-ripgrep |
 | `agent-recall-index-file` | Path to persistent index file |
 | `agent-recall-browse-sort` | Sort order: date-desc, date-asc, modified-desc, modified-asc, project |
+| `agent-recall-resume-continue-transcript` | Append to original transcript on resume (default: t) |
 | `agent-recall-claude-config-dir` | Claude CLI config directory for session matching |
 | `agent-recall-session-match-window` | Max seconds for timestamp matching (default: 120) |
 

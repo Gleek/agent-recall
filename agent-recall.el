@@ -361,7 +361,7 @@ after installing agent-recall, or to pick up transcripts created
 outside of agent-shell sessions tracked by the hook."
   (interactive)
   (unless agent-recall-search-paths
-    (user-error "agent-recall-search-paths is not set.  Configure it first, e.g.:
+    (user-error "Agent-recall-search-paths is not set.  Configure it first, e.g.:
   (setq agent-recall-search-paths '(\"~/projects\" \"~/work\"))"))
   (let ((dirs '())
         (new-index (make-hash-table :test 'equal))
@@ -450,7 +450,7 @@ Falls back to standard grep, available on all systems."
   "Search transcripts for QUERY using `deadgrep'.
 DIRS are unused; deadgrep searches the symlink directory instead."
   (unless (fboundp 'deadgrep)
-    (user-error "deadgrep is not installed.  Install it or set `agent-recall-search-function' to `grep'"))
+    (user-error "Deadgrep is not installed.  Install it or set `agent-recall-search-function' to `grep'"))
   (let ((dir (agent-recall--ensure-symlink-dir))
         (deadgrep-extra-arguments (append deadgrep-extra-arguments '("--follow"))))
     (deadgrep query dir)))
@@ -459,7 +459,7 @@ DIRS are unused; deadgrep searches the symlink directory instead."
   "Search transcripts for QUERY using `counsel-rg'.
 DIRS are unused; counsel-rg searches the symlink directory instead."
   (unless (fboundp 'counsel-rg)
-    (user-error "counsel is not installed.  Install it or set `agent-recall-search-function' to `grep'"))
+    (user-error "Counsel is not installed.  Install it or set `agent-recall-search-function' to `grep'"))
   (let* ((dir (agent-recall--ensure-symlink-dir))
          (counsel-rg-base-command
           (list "rg" "--max-columns" "240" "--with-filename"
@@ -471,7 +471,7 @@ DIRS are unused; counsel-rg searches the symlink directory instead."
   "Search transcripts using `consult-ripgrep'.
 QUERY and DIRS are unused; consult-ripgrep prompts interactively."
   (unless (fboundp 'consult-ripgrep)
-    (user-error "consult is not installed.  Install it or set `agent-recall-search-function' to `grep'"))
+    (user-error "Consult is not installed.  Install it or set `agent-recall-search-function' to `grep'"))
   (let ((dir (agent-recall--ensure-symlink-dir)))
     (consult-ripgrep dir)))
 
@@ -964,7 +964,7 @@ Returns an Emacs time value (as from `encode-time'), or nil."
           (encode-time second minute hour day month year nil))))))
 
 (defun agent-recall--parse-iso8601-timestamp (iso-string)
-  "Parse an ISO 8601 timestamp string into an Emacs time value.
+  "Parse ISO-STRING, an ISO 8601 timestamp, into an Emacs time value.
 Handles formats like `2026-03-27T22:27:33.061Z' and `2026-03-27T22:27:33Z'."
   (when (and iso-string
              (string-match
@@ -1096,7 +1096,7 @@ Skips system/command messages that start with `<'."
      (replace-regexp-in-string "\\s-+" " " (string-trim text)))))
 
 (defun agent-recall--match-session (transcript-time transcript-file sessions claude-dir)
-  "Find the session matching TRANSCRIPT-FILE from SESSIONS.
+  "Find the session matching TRANSCRIPT-FILE at TRANSCRIPT-TIME from SESSIONS.
 SESSIONS is an alist of (SESSION-ID . CREATED-TIME).
 CLAUDE-DIR is the Claude project directory containing JSONL files.
 Uses hybrid matching: timestamp narrows candidates, message content confirms.

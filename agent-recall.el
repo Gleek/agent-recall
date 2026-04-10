@@ -89,7 +89,7 @@
   :prefix "agent-recall-")
 
 (defface agent-recall-header-key
-  '((t :inherit warning :weight bold))
+  '((t :inherit warning))
   "Face for keybinding letters in the transcript header line."
   :group 'agent-recall)
 

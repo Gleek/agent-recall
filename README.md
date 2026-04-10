@@ -295,9 +295,9 @@ The index is built by `agent-recall-reindex` (scans the filesystem) and grows au
 Session IDs are resolved in order:
 
 1. **Embedded header** — a `**Session:** UUID` line written by `agent-recall-track-sessions` or `agent-recall-backfill`
-2. **Retroactive matching** — compares the transcript's `**Started:**` timestamp against Claude session data in `~/.claude/projects/`, finding the closest session within `agent-recall-session-match-window` seconds
+2. **Retroactive matching** — hybrid approach: narrows candidates by comparing the transcript's `**Started:**` timestamp against Claude session data in `~/.claude/projects/` (within `agent-recall-session-match-window` seconds), then confirms by comparing the first user message in the transcript against the first message in the Claude JSONL file
 
-Results are cached in memory for the duration of the Emacs session.
+The main index is persisted to disk and loads automatically. Retroactive matching results are cached in memory to avoid re-running the expensive JSONL comparison on every access.
 
 ### Search directory
 

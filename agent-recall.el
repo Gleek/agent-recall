@@ -3,7 +3,7 @@
 ;; Author: Marcos Andrade
 ;; URL: https://github.com/Marx-A00/agent-recall
 ;; Version: 0.3.0
-;; Package-Requires: ((emacs "28.1") (agent-shell "0.1.0"))
+;; Package-Requires: ((emacs "29.1") (agent-shell "0.1.0"))
 ;; Keywords: tools, convenience, ai
 
 ;; This file is NOT part of GNU Emacs.

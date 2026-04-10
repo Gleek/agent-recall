@@ -74,6 +74,8 @@
 (require 'grep)
 (require 'json)
 
+(defvar deadgrep-extra-arguments)
+
 ;;;; Customization
 
 (defgroup agent-recall nil

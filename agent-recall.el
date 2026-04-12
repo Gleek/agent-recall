@@ -82,6 +82,7 @@
 (declare-function evil-local-set-key "evil-core" (state key def))
 (declare-function deadgrep "deadgrep" (search-term &optional directory))
 (declare-function counsel-rg "counsel" (&optional initial-input initial-directory extra-rg-args rg-prompt))
+(defvar consult-ripgrep-args)
 (declare-function consult-ripgrep "consult" (&optional dir initial))
 
 ;;;; Customization
@@ -517,13 +518,17 @@ DIRS are unused; counsel-rg searches the symlink directory instead."
                (agent-recall--transcript-file-p (buffer-file-name)))
       (agent-recall-transcript-mode 1))))
 
-(defun agent-recall--search-via-consult-ripgrep (_query _dirs)
-  "Search transcripts using `consult-ripgrep'.
-QUERY and DIRS are unused; consult-ripgrep prompts interactively."
-  (unless (fboundp 'consult-ripgrep)
+(defun agent-recall--search-via-consult-ripgrep (query _dirs)
+  "Search transcripts for QUERY using `consult-ripgrep'.
+DIRS are unused; consult-ripgrep searches the symlink directory instead."
+  (unless (require 'consult nil t)
     (user-error "Consult is not installed.  Install it or set `agent-recall-search-function' to `grep'"))
-  (let ((dir (agent-recall--ensure-symlink-dir)))
-    (consult-ripgrep dir)
+  (let* ((dir (agent-recall--ensure-symlink-dir))
+         (consult-ripgrep-args
+          (concat consult-ripgrep-args
+                  " --follow"
+                  " --glob " agent-recall-file-pattern)))
+    (consult-ripgrep dir query)
     (when (and agent-recall-auto-transcript-mode
                (agent-recall--transcript-file-p (buffer-file-name)))
       (agent-recall-transcript-mode 1))))

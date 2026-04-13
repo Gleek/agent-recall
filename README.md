@@ -4,8 +4,6 @@ Search, browse, and resume [agent-shell](https://github.com/xenodium/agent-shell
 
 ![total-recall](total-recall.png)
 
-![agent-recall](agent-recall.png)
-
 ## agent-recall
 
 [agent-shell](https://github.com/xenodium/agent-shell) automatically saves full conversation transcripts as Markdown files in `.agent-shell/transcripts/` within your projects. Over time these accumulate into a rich knowledge base of AI interactions, but there's no built-in way to search across them or resume past conversations.

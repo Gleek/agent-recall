@@ -75,6 +75,7 @@
 (require 'agent-shell)
 (require 'cl-lib)
 (require 'grep)
+(require 'iso8601)
 (require 'json)
 
 (defvar deadgrep-extra-arguments)
@@ -385,7 +386,7 @@ after installing agent-recall, or to pick up transcripts created
 outside of agent-shell sessions tracked by the hook."
   (interactive)
   (unless agent-recall-search-paths
-    (user-error "Agent-recall-search-paths is not set.  Configure it first, e.g.:
+    (user-error "`agent-recall-search-paths' is not set.  Configure it first, e.g.:
   (setq agent-recall-search-paths '(\"~/projects\" \"~/work\"))"))
   (let ((dirs '())
         (new-index (make-hash-table :test 'equal))
@@ -394,10 +395,11 @@ outside of agent-shell sessions tracked by the hook."
     ;; Discover transcript directories (same find logic as before)
     (dolist (root agent-recall-search-paths)
       (when (file-directory-p root)
-        (let* ((cmd (format "find %s -maxdepth %d -path '*/%s' -type d 2>/dev/null"
+        (let* ((cmd (format "find %s -maxdepth %d -path %s -type d 2>/dev/null"
                             (shell-quote-argument (expand-file-name root))
                             agent-recall-max-depth
-                            agent-recall-transcript-dir-name))
+                            (shell-quote-argument
+                             (concat "*/" agent-recall-transcript-dir-name))))
                (output (shell-command-to-string cmd))
                (found (split-string output "\n" t)))
           (setq dirs (append dirs found)))))
@@ -430,7 +432,7 @@ outside of agent-shell sessions tracked by the hook."
       (message "agent-recall: indexed %d transcripts across %d projects%s"
                file-count project-count
                (if (> without-session 0)
-                   (format " (%d without session IDs — run M-x agent-recall-backfill to enable resume)"
+                   (format " (%d without session IDs -- run M-x agent-recall-backfill to enable resume)"
                            without-session)
                  "")))))
 
@@ -559,7 +561,7 @@ otherwise falls back to the best available live backend."
     (pcase agent-recall-search-function
       ('counsel-rg       (agent-recall--search-via-counsel-rg "" dirs))
       ('consult-ripgrep  (agent-recall--search-via-consult-ripgrep "" dirs))
-      ;; deadgrep and grep don't do live filtering — pick best available
+      ;; deadgrep and grep don't do live filtering -- pick best available
       (_
        (cond
         ((fboundp 'counsel-rg)      (agent-recall--search-via-counsel-rg "" dirs))
@@ -904,7 +906,7 @@ Only shows transcripts that have resolvable session IDs."
     (with-current-buffer (get-buffer-create "*agent-recall-stats*")
       (let ((inhibit-read-only t))
         (erase-buffer)
-        (insert (propertize "Agent Recall — Transcript Statistics\n"
+        (insert (propertize "Agent Recall -- Transcript Statistics\n"
                             'face 'info-title-1))
         (insert (make-string 40 ?═) "\n\n")
         (insert (format "  Transcripts: %d\n" total-files))
@@ -1016,32 +1018,18 @@ Returns an Emacs time value (as from `encode-time'), or nil."
       (insert-file-contents file nil 0 500)
       (goto-char (point-min))
       (when (re-search-forward
-             "^\\*\\*Started:\\*\\*\\s-+\\([0-9]\\{4\\}\\)-\\([0-9]\\{2\\}\\)-\\([0-9]\\{2\\}\\)\\s-+\\([0-9]\\{2\\}\\):\\([0-9]\\{2\\}\\):\\([0-9]\\{2\\}\\)"
+             "^\\*\\*Started:\\*\\*\\s-+\\(.+\\)$"
              nil t)
-        (let ((year   (string-to-number (match-string 1)))
-              (month  (string-to-number (match-string 2)))
-              (day    (string-to-number (match-string 3)))
-              (hour   (string-to-number (match-string 4)))
-              (minute (string-to-number (match-string 5)))
-              (second (string-to-number (match-string 6))))
-          ;; encode-time with nil timezone uses the current system timezone
-          (encode-time second minute hour day month year nil))))))
+        (let ((decoded (parse-time-string (match-string 1))))
+          (when (nth 5 decoded)
+            (encode-time (decoded-time-set-defaults decoded))))))))
 
 (defun agent-recall--parse-iso8601-timestamp (iso-string)
-  "Parse ISO-STRING, an ISO 8601 timestamp, into an Emacs time value.
-Handles formats like `2026-03-27T22:27:33.061Z' and `2026-03-27T22:27:33Z'."
-  (when (and iso-string
-             (string-match
-              "\\([0-9]\\{4\\}\\)-\\([0-9]\\{2\\}\\)-\\([0-9]\\{2\\}\\)T\\([0-9]\\{2\\}\\):\\([0-9]\\{2\\}\\):\\([0-9]\\{2\\}\\)"
-              iso-string))
-    (let ((year   (string-to-number (match-string 1 iso-string)))
-          (month  (string-to-number (match-string 2 iso-string)))
-          (day    (string-to-number (match-string 3 iso-string)))
-          (hour   (string-to-number (match-string 4 iso-string)))
-          (minute (string-to-number (match-string 5 iso-string)))
-          (second (string-to-number (match-string 6 iso-string))))
-      ;; UTC (timezone offset 0)
-      (encode-time second minute hour day month year 0))))
+  "Parse ISO-STRING into an Emacs time value, or nil if unparseable."
+  (when iso-string
+    (condition-case nil
+        (encode-time (iso8601-parse iso-string))
+      (error nil))))
 
 (defun agent-recall--claude-project-dir (project-path)
   "Return the Claude sessions directory for PROJECT-PATH.
@@ -1182,7 +1170,7 @@ Returns session ID string, or nil."
                            (agent-recall--normalize-message
                             (agent-recall--transcript-first-message transcript-file)))))
     (cond
-     ;; Has candidates and a message — try to confirm with content
+     ;; Has candidates and a message -- try to confirm with content
      ((and candidates transcript-msg)
       (let ((confirmed nil))
         (dolist (cand candidates)
@@ -1195,7 +1183,7 @@ Returns session ID string, or nil."
                 (setq confirmed id)))))
         ;; If no message match, fall back to closest timestamp
         (or confirmed (car (car candidates)))))
-     ;; Has candidates but no message — closest timestamp
+     ;; Has candidates but no message -- closest timestamp
      (candidates
       (car (car candidates)))
      ;; No candidates
@@ -1214,10 +1202,10 @@ Returns session ID string, or nil if unresolvable."
      ;; Cache hit with a real session ID
      ((and cached (not (eq cached 'none)))
       cached)
-     ;; Cache hit with 'none — we already tried and failed
+     ;; Cache hit with 'none -- we already tried and failed
      ((eq cached 'none)
       nil)
-     ;; Cache miss — resolve
+     ;; Cache miss -- resolve
      (t
       (let ((session-id
              (or
@@ -1267,8 +1255,8 @@ Results are displayed in the `*agent-recall-backfill*' buffer."
         (erase-buffer)
         (insert (propertize
                  (if actually-write
-                     "Agent Recall — Backfill (WRITING)\n"
-                   "Agent Recall — Backfill (DRY RUN)\n")
+                     "Agent Recall -- Backfill (WRITING)\n"
+                   "Agent Recall -- Backfill (DRY RUN)\n")
                  'face 'info-title-1))
         (insert (make-string 50 ?═) "\n\n")
         (maphash

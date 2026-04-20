@@ -1,5 +1,7 @@
 # Agent Recall
 
+[![MELPA](https://melpa.org/packages/agent-recall-badge.svg)](https://melpa.org/#/agent-recall)
+
 Search, browse, and resume [agent-shell](https://github.com/xenodium/agent-shell) conversation transcripts.
 
 ![total-recall](total-recall.png)
@@ -29,15 +31,19 @@ Features:
 
 ### Installation
 
-agent-recall is a single-file package. Clone and add to your load path:
+#### MELPA (recommended)
 
-```bash
-git clone https://github.com/Marx-A00/agent-recall.git ~/.emacs.d/agent-recall
+agent-recall is available on [MELPA](https://melpa.org/#/agent-recall). Make sure MELPA is in your `package-archives`, then:
+
 ```
+M-x package-install RET agent-recall RET
+```
+
+Or with `use-package`:
 
 ```elisp
 (use-package agent-recall
-  :load-path "~/.emacs.d/agent-recall"
+  :ensure t
   :config
   (setq agent-recall-search-paths '("~/projects" "~/work")))
 ```
@@ -56,14 +62,26 @@ git clone https://github.com/Marx-A00/agent-recall.git ~/.emacs.d/agent-recall
 In `packages.el`:
 
 ```elisp
-(package! agent-recall
-  :recipe (:host github :repo "Marx-A00/agent-recall"))
+(package! agent-recall)
 ```
 
 In `config.el`:
 
 ```elisp
 (use-package! agent-recall
+  :config
+  (setq agent-recall-search-paths '("~/projects" "~/work")))
+```
+
+#### Manual
+
+```bash
+git clone https://github.com/Marx-A00/agent-recall.git ~/.emacs.d/agent-recall
+```
+
+```elisp
+(use-package agent-recall
+  :load-path "~/.emacs.d/agent-recall"
   :config
   (setq agent-recall-search-paths '("~/projects" "~/work")))
 ```
@@ -130,7 +148,7 @@ To automatically embed session IDs in new transcripts (enabling instant resume):
 
 ```elisp
 (use-package agent-recall
-  :load-path "~/.emacs.d/agent-recall"
+  :ensure t
   :hook (agent-shell-mode . agent-recall-track-sessions)
   :config
   (setq agent-recall-search-paths '("~/projects" "~/work")

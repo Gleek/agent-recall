@@ -1493,13 +1493,16 @@ Results are displayed in the `*agent-recall-backfill*' buffer."
           (agent-recall--start-resume session-id file)
         (user-error "This transcript has no resumable session ID")))))
 
-(with-eval-after-load 'embark
-  (defvar-keymap agent-recall-transcript-embark-map
-    :doc "Embark actions for agent-recall transcript candidates."
-    "o" #'agent-recall-embark-open-other-window
-    "r" #'agent-recall-embark-resume)
-  (add-to-list 'embark-keymap-alist
-               '(agent-recall-transcript . agent-recall-transcript-embark-map)))
+(defvar agent-recall-transcript-embark-map
+  (let ((map (make-sparse-keymap)))
+    (define-key map (kbd "o") #'agent-recall-embark-open-other-window)
+    (define-key map (kbd "r") #'agent-recall-embark-resume)
+    map)
+  "Embark actions for agent-recall transcript candidates.")
+
+(eval-after-load 'embark
+  '(add-to-list 'embark-keymap-alist
+                '(agent-recall-transcript . agent-recall-transcript-embark-map)))
 
 (provide 'agent-recall)
 ;;; agent-recall.el ends here

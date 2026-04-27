@@ -16,7 +16,7 @@ Features:
 
 - **Search** all transcripts with built-in grep (no external dependencies) or optional [ripgrep](https://github.com/BurntSushi/ripgrep) backends
 - **Live search** with real-time filtering via counsel-rg or consult-ripgrep
-- **Browse** transcripts by project and date with previews
+- **Browse** transcripts by project and date with live preview (consult or ivy/counsel)
 - **Resume** past agent-shell sessions directly from a transcript
 - **Track** session IDs automatically via hook
 - **Backfill** session IDs into old transcripts retroactively
@@ -40,6 +40,22 @@ M-x package-install RET agent-recall RET
 ```
 
 Or with `use-package`:
+
+```elisp
+(use-package agent-recall
+  :ensure t
+  :config
+  (setq agent-recall-search-paths '("~/projects" "~/work")))
+```
+
+#### Elpaca
+
+```elisp
+(elpaca agent-recall
+  (setq agent-recall-search-paths '("~/projects" "~/work")))
+```
+
+Or with use-package integration:
 
 ```elisp
 (use-package agent-recall
@@ -183,6 +199,21 @@ To automatically embed session IDs in new transcripts (enabling instant resume):
 
 `M-x agent-recall-browse` shows a completion list of all transcripts in `[project] timestamp` format with preview annotations. Selecting a transcript opens it in `agent-recall-transcript-mode`.
 
+When `agent-recall-browse-preview` is non-nil (the default), browse provides live preview of transcripts as you navigate candidates:
+
+- **consult** users get preview via `consult--read` (vertico ecosystem)
+- **ivy/counsel** users get preview via `ivy-read` with `:update-fn` (ivy ecosystem)
+- Without either, falls back to plain `completing-read`
+
+#### Embark integration
+
+If you use [embark](https://github.com/oantolin/embark), agent-recall registers actions for browse candidates automatically:
+
+| Key | Action |
+|-----|--------|
+| `o` | Open transcript in other window |
+| `r` | Resume session |
+
 ### Transcript mode
 
 When you open a transcript via `agent-recall-browse`, `agent-recall-search`, or `agent-recall-search-live`, `agent-recall-transcript-mode` activates automatically. The buffer becomes read-only and shows a header line with available actions.
@@ -258,6 +289,7 @@ In `agent-recall-transcript-mode`:
 |-----|---------|
 | `r` | Resume session (if session ID present) |
 | `c` | Open clean view (strip tool calls) |
+| `b` | Return to browse list |
 | `C-c C-n` | Jump to next user message |
 | `C-c C-p` | Jump to previous user message |
 | `q` | Quit window (evil) |
@@ -290,6 +322,7 @@ Evil users get additional bindings in normal state:
 | `agent-recall-search-function` | Search backend: grep, deadgrep, counsel-rg, consult-ripgrep |
 | `agent-recall-index-file` | Path to persistent index file |
 | `agent-recall-browse-sort` | Sort order: date-desc, date-asc, modified-desc, modified-asc, project |
+| `agent-recall-browse-preview` | Live preview in browse via consult or ivy (default: t) |
 | `agent-recall-auto-transcript-mode` | Auto-activate transcript-mode from agent-recall commands (default: t) |
 | `agent-recall-resume-continue-transcript` | Append to original transcript on resume (default: t) |
 | `agent-recall-claude-config-dir` | Claude CLI config directory for session matching |

@@ -2,7 +2,7 @@
 
 ;; Author: Marcos Andrade <https://github.com/Marx-A00>
 ;; URL: https://github.com/Marx-A00/agent-recall
-;; Version: 0.4.0
+;; Version: 0.5.0
 ;; Package-Requires: ((emacs "29.1") (agent-shell "0.1.0"))
 ;; Keywords: tools, convenience, ai
 
@@ -85,6 +85,16 @@
 (declare-function counsel-rg "counsel" (&optional initial-input initial-directory extra-rg-args rg-prompt))
 (defvar consult-ripgrep-args)
 (declare-function consult-ripgrep "consult" (&optional dir initial))
+(declare-function consult--read "consult")
+(declare-function consult--temporary-files "consult")
+(declare-function consult--buffer-preview "consult")
+(declare-function ivy-read "ivy")
+(declare-function ivy-state-current "ivy")
+(declare-function ivy--get-window "ivy")
+(defvar ivy-last)
+(defvar ivy-update-fns-alist)
+(defvar ivy-unwind-fns-alist)
+(defvar embark-keymap-alist)
 
 ;;;; Customization
 
@@ -232,6 +242,13 @@ with \\[agent-recall-transcript-mode]."
   :type 'boolean
   :group 'agent-recall)
 
+(defcustom agent-recall-browse-preview t
+  "Whether to show live preview in `agent-recall-browse' when available.
+When non-nil, uses consult or ivy for live transcript preview as you
+navigate candidates.  When nil, falls back to plain `completing-read'."
+  :type 'boolean
+  :group 'agent-recall)
+
 ;;;; Internal State
 
 (defvar agent-recall--index nil
@@ -244,6 +261,9 @@ Keys are absolute file paths, values are plists
 
 (defvar agent-recall--symlink-dir nil
   "Path to temporary symlink directory for multi-dir search backends.")
+
+(defvar agent-recall--browse-history nil
+  "History list for `agent-recall-browse' selections.")
 
 (defvar agent-recall--session-id-cache (make-hash-table :test 'equal)
   "Cache mapping transcript file paths to session IDs.
@@ -607,42 +627,150 @@ Returns the first user message, truncated."
         (truncate-string-to-width (string-trim (match-string 1)) 80)
       "(empty)")))
 
+(defun agent-recall--candidate-file (candidate)
+  "Extract the file path stored as a text property on CANDIDATE."
+  (get-text-property 0 'agent-recall-file candidate))
+
+(defun agent-recall--open-transcript (file &optional other-window)
+  "Open transcript FILE and enable `agent-recall-transcript-mode' if configured.
+When OTHER-WINDOW is non-nil, open in another window."
+  (if other-window
+      (find-file-other-window file)
+    (find-file file))
+  (goto-char (point-min))
+  (when agent-recall-auto-transcript-mode
+    (agent-recall-transcript-mode 1)))
+
+(defun agent-recall--browse-preview-state (file-lookup)
+  "Return a consult state function for live preview of transcripts.
+FILE-LOOKUP is a hash table mapping display strings to file paths.
+Uses consult's own preview machinery for buffer display and cleanup."
+  (let ((open (consult--temporary-files))
+        (preview (consult--buffer-preview)))
+    (lambda (action cand)
+      (unless cand
+        (funcall open))
+      (let* ((file (and cand (gethash cand file-lookup)))
+             (buf (and file
+                       (eq action 'preview)
+                       (funcall open file))))
+        (funcall preview action
+                 (and buf (buffer-name buf)))))))
+
+(defun agent-recall--browse-consult (candidates annotate-fn)
+  "Browse transcripts using consult with live preview.
+CANDIDATES is a list of propertized display strings.
+ANNOTATE-FN is the annotation function.
+Returns the selected candidate string, or nil."
+  (let ((file-lookup (make-hash-table :test 'equal)))
+    (dolist (cand candidates)
+      (when-let* ((file (agent-recall--candidate-file cand)))
+        (puthash (substring-no-properties cand) file file-lookup)))
+    (consult--read
+     candidates
+     :prompt "Transcript: "
+     :annotate annotate-fn
+     :state (agent-recall--browse-preview-state file-lookup)
+     :lookup (lambda (selected candidates &rest _)
+               (car (member selected candidates)))
+     :category 'agent-recall-transcript
+     :sort nil
+     :require-match t
+     :default (car agent-recall--browse-history)
+     :history 'agent-recall--browse-history)))
+
+(defvar agent-recall--ivy-temporary-buffers nil
+  "Buffers opened during `agent-recall-browse' ivy preview.")
+
+(defun agent-recall--ivy-browse-update-fn ()
+  "Preview the current ivy candidate transcript in the window."
+  (let* ((current (ivy-state-current ivy-last))
+         (file (agent-recall--candidate-file current)))
+    (when file
+      (let ((buf (get-file-buffer file)))
+        (unless buf
+          (setq buf (find-file-noselect file))
+          (push buf agent-recall--ivy-temporary-buffers))
+        (with-selected-window (ivy--get-window ivy-last)
+          (switch-to-buffer buf 'norecord))))))
+
+(defun agent-recall--ivy-browse-unwind ()
+  "Clean up temporary buffers opened during ivy browse preview."
+  (mapc #'kill-buffer agent-recall--ivy-temporary-buffers)
+  (setq agent-recall--ivy-temporary-buffers nil))
+
+(defun agent-recall--browse-ivy (candidates _annotate-fn)
+  "Browse transcripts using ivy with live preview.
+CANDIDATES is a list of propertized display strings.
+Returns the selected candidate string, or nil."
+  (let ((ivy-update-fns-alist
+         (cons '(agent-recall-browse . agent-recall--ivy-browse-update-fn)
+               ivy-update-fns-alist))
+        (ivy-unwind-fns-alist
+         (cons '(agent-recall-browse . agent-recall--ivy-browse-unwind)
+               ivy-unwind-fns-alist)))
+    (unwind-protect
+        (ivy-read "Transcript: " candidates
+                  :caller 'agent-recall-browse
+                  :require-match t
+                  :preselect (car agent-recall--browse-history)
+                  :history 'agent-recall--browse-history
+                  :action (lambda (x) x))
+      (agent-recall--ivy-browse-unwind))))
+
+(defun agent-recall--browse-default (candidates annotate-fn)
+  "Browse transcripts with plain `completing-read'.
+CANDIDATES is a list of propertized display strings.
+ANNOTATE-FN is the annotation function.
+Returns the selected candidate string, or nil."
+  (completing-read
+   "Transcript: "
+   (lambda (string pred action)
+     (if (eq action 'metadata)
+         `(metadata
+           (category . agent-recall-transcript)
+           (annotation-function . ,annotate-fn))
+       (complete-with-action action candidates string pred)))
+   nil t nil 'agent-recall--browse-history
+   (car agent-recall--browse-history)))
+
 ;;;###autoload
 (defun agent-recall-browse ()
   "Browse and open agent-shell transcripts.
 Presents a searchable list of all transcripts grouped by project.
-When a transcript has an associated session ID and agent-shell is
-loaded, offers to resume the session."
+When `agent-recall-browse-preview' is non-nil, provides live preview
+using consult or ivy if available.  Falls back to plain `completing-read'."
   (interactive)
   (let* ((transcripts (agent-recall--list-transcripts)))
     (unless transcripts
       (user-error "No transcripts indexed.  Run M-x agent-recall-reindex"))
-    (let* ((previews (make-hash-table :test 'equal))
-           (_ (maphash (lambda (_file entry)
-                         (let* ((project (plist-get entry :project))
-                                (ts (plist-get entry :timestamp))
-                                (display (format "[%s] %s" project ts)))
-                           (puthash display (or (plist-get entry :preview) "") previews)))
-                       agent-recall--index))
-           (selection (completing-read
-                       "Transcript: "
-                       (lambda (string pred action)
-                         (if (eq action 'metadata)
-                             `(metadata
-                               (annotation-function
-                                . ,(lambda (candidate)
-                                     (let ((preview (gethash candidate previews)))
-                                       (when (and preview (not (string-empty-p preview)))
-                                         (concat "  " preview))))))
-                           (complete-with-action
-                            action (mapcar #'car transcripts) string pred)))
-                       nil t))
-           (file (cdr (assoc selection transcripts))))
+    (let* ((candidates
+            (mapcar (lambda (entry)
+                      (propertize (car entry)
+                                  'agent-recall-file (cdr entry)))
+                    transcripts))
+           (annotate-fn (lambda (candidate)
+                          (when-let* ((file (agent-recall--candidate-file candidate))
+                                      (idx-entry (gethash file agent-recall--index))
+                                      (preview (plist-get idx-entry :preview)))
+                            (unless (string-empty-p preview)
+                              (concat "  " preview)))))
+           (selection
+            (cond
+             ((and agent-recall-browse-preview
+                   (bound-and-true-p ivy-mode)
+                   (require 'ivy nil t))
+              (agent-recall--browse-ivy candidates annotate-fn))
+             ((and agent-recall-browse-preview
+                   (require 'consult nil t))
+              (agent-recall--browse-consult candidates annotate-fn))
+             (t
+              (agent-recall--browse-default candidates annotate-fn))))
+           (file (and selection
+                      (or (agent-recall--candidate-file selection)
+                          (cdr (assoc selection transcripts))))))
       (when file
-        (find-file file)
-        (goto-char (point-min))
-        (when agent-recall-auto-transcript-mode
-          (agent-recall-transcript-mode))))))
+        (agent-recall--open-transcript file)))))
 
 (defun agent-recall-clean-view ()
   "Open a clean view of the current transcript.
@@ -713,10 +841,17 @@ plain markdown buffer you can render with your preferred method."
         (goto-char pos)
       (message "No earlier user messages"))))
 
+(defun agent-recall-browse-from-transcript ()
+  "Quit current transcript and return to `agent-recall-browse'."
+  (interactive)
+  (quit-window)
+  (agent-recall-browse))
+
 (defvar agent-recall-transcript-mode-map
   (let ((map (make-sparse-keymap)))
     (define-key map (kbd "r") #'agent-recall-resume-current)
     (define-key map (kbd "c") #'agent-recall-clean-view)
+    (define-key map (kbd "b") #'agent-recall-browse-from-transcript)
     (define-key map (kbd "C-c C-n") #'agent-recall-next-user-message)
     (define-key map (kbd "C-c C-p") #'agent-recall-prev-user-message)
     map)
@@ -737,6 +872,7 @@ When SESSION-ID is non-nil, include a resume entry."
              "r" (format "Resume (%s)" (substring session-id 0 8)))
             entries))
     (push (agent-recall--header-entry "c" "Clean") entries)
+    (push (agent-recall--header-entry "b" "Browse") entries)
     (push (agent-recall--header-entry "C-j/C-k" "Navigate") entries)
     (push (agent-recall--header-entry "q" "Quit") entries)
     (concat "  " (mapconcat #'identity (nreverse entries) "  "))))
@@ -760,6 +896,7 @@ When the transcript has a resumable session ID, press `r' to resume."
           (evil-local-set-key 'normal (kbd "[[") #'agent-recall-prev-user-message)
           (evil-local-set-key 'normal (kbd "gj") #'agent-recall-next-user-message)
           (evil-local-set-key 'normal (kbd "gk") #'agent-recall-prev-user-message)
+          (evil-local-set-key 'normal (kbd "b") #'agent-recall-browse-from-transcript)
           (evil-local-set-key 'normal (kbd "q") #'quit-window))
         (setq-local header-line-format
                     (agent-recall--header-line session-id)))
@@ -1340,6 +1477,29 @@ Results are displayed in the `*agent-recall-backfill*' buffer."
       (goto-char (point-min))
       (special-mode)
       (pop-to-buffer (current-buffer)))))
+
+;;;; Embark Integration
+
+(defun agent-recall-embark-open-other-window (candidate)
+  "Open transcript CANDIDATE in another window."
+  (when-let* ((file (agent-recall--candidate-file candidate)))
+    (agent-recall--open-transcript file t)))
+
+(defun agent-recall-embark-resume (candidate)
+  "Resume the agent-shell session for transcript CANDIDATE."
+  (when-let* ((file (agent-recall--candidate-file candidate)))
+    (let ((session-id (agent-recall--resolve-session-id file)))
+      (if session-id
+          (agent-recall--start-resume session-id file)
+        (user-error "This transcript has no resumable session ID")))))
+
+(with-eval-after-load 'embark
+  (defvar-keymap agent-recall-transcript-embark-map
+    :doc "Embark actions for agent-recall transcript candidates."
+    "o" #'agent-recall-embark-open-other-window
+    "r" #'agent-recall-embark-resume)
+  (add-to-list 'embark-keymap-alist
+               '(agent-recall-transcript . agent-recall-transcript-embark-map)))
 
 (provide 'agent-recall)
 ;;; agent-recall.el ends here

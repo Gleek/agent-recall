@@ -741,6 +741,7 @@ Presents a searchable list of all transcripts grouped by project.
 When `agent-recall-browse-preview' is non-nil, provides live preview
 using consult or ivy if available.  Falls back to plain `completing-read'."
   (interactive)
+  (agent-recall--setup-embark)
   (let* ((transcripts (agent-recall--list-transcripts)))
     (unless transcripts
       (user-error "No transcripts indexed.  Run M-x agent-recall-reindex"))
@@ -1500,9 +1501,13 @@ Results are displayed in the `*agent-recall-backfill*' buffer."
     map)
   "Embark actions for agent-recall transcript candidates.")
 
-(eval-after-load 'embark
-  '(add-to-list 'embark-keymap-alist
-                '(agent-recall-transcript . agent-recall-transcript-embark-map)))
+(defun agent-recall--setup-embark ()
+  "Register embark actions for agent-recall transcript candidates."
+  (when (bound-and-true-p embark-keymap-alist)
+    (add-to-list 'embark-keymap-alist
+                 '(agent-recall-transcript . agent-recall-transcript-embark-map))))
+
+(agent-recall--setup-embark)
 
 (provide 'agent-recall)
 ;;; agent-recall.el ends here

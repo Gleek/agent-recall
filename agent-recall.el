@@ -1208,22 +1208,45 @@ is an Emacs time value."
 
 (defun agent-recall--scan-jsonl-timestamps (claude-dir)
   "Scan JSONL files in CLAUDE-DIR for session timestamps.
-Reads only the first line of each file for efficiency.
+Emits one entry per minute of activity per session.  Resumed sessions
+append to the same JSONL across multiple days; emitting per-minute
+keeps each resumption epoch as a candidate the matcher can pick from.
 Returns an alist of (SESSION-ID . CREATED-TIME)."
-  (let ((result '()))
+  (let ((result '())
+        (seen (make-hash-table :test 'equal))
+        (parse-fn (if (fboundp 'json-parse-string)
+                      (lambda (s)
+                        (json-parse-string s :object-type 'alist))
+                    (lambda (s)
+                      (let ((json-object-type 'alist)
+                            (json-key-type 'symbol))
+                        (json-read-from-string s))))))
     (dolist (file (directory-files claude-dir t "\\.jsonl\\'"))
       (let ((session-id (file-name-sans-extension (file-name-nondirectory file))))
         (condition-case nil
             (with-temp-buffer
-              (insert-file-contents file nil 0 1000)
+              (insert-file-contents file)
               (goto-char (point-min))
-              (let* ((json-object-type 'alist)
-                     (json-key-type 'symbol)
-                     (data (json-read))
-                     (ts (alist-get 'timestamp data))
-                     (time (agent-recall--parse-iso8601-timestamp ts)))
-                (when time
-                  (push (cons session-id time) result))))
+              (while (not (eobp))
+                (let ((line (buffer-substring-no-properties
+                             (line-beginning-position) (line-end-position))))
+                  (when (> (length line) 0)
+                    (condition-case nil
+                        (let* ((data (funcall parse-fn line))
+                               (type (alist-get 'type data)))
+                          (when (equal type "user")
+                            (let* ((ts (alist-get 'timestamp data))
+                                   (minute-key (when (and ts (>= (length ts) 16))
+                                                 (substring ts 0 16)))
+                                   (dedup-key (and minute-key
+                                                   (concat session-id "|" minute-key))))
+                              (when (and dedup-key (not (gethash dedup-key seen)))
+                                (puthash dedup-key t seen)
+                                (let ((time (agent-recall--parse-iso8601-timestamp ts)))
+                                  (when time
+                                    (push (cons session-id time) result)))))))
+                      (error nil))))
+                (forward-line 1)))
           (error nil))))
     result))
 
@@ -1387,7 +1410,8 @@ Results are displayed in the `*agent-recall-backfill*' buffer."
          (skipped 0)
          (no-match 0)
          (total 0)
-         (modified-files '()))
+         (modified-files '())
+         (sessions-cache (make-hash-table :test 'equal)))
     (with-current-buffer (get-buffer-create "*agent-recall-backfill*")
       (let ((inhibit-read-only t))
         (erase-buffer)
@@ -1419,13 +1443,17 @@ Results are displayed in the `*agent-recall-backfill*' buffer."
                           (transcript-time (agent-recall--parse-transcript-timestamp file))
                           (session-id nil))
                      (when claude-dir
-                       (let* ((all-sessions
-                               (cl-remove-if-not
-                                (lambda (s) (and (car s) (cdr s)))
-                                (delete-dups
-                                 (append
-                                  (agent-recall--load-sessions-index claude-dir)
-                                  (agent-recall--scan-jsonl-timestamps claude-dir))))))
+                       (let ((all-sessions
+                              (or (gethash claude-dir sessions-cache)
+                                  (puthash
+                                   claude-dir
+                                   (cl-remove-if-not
+                                    (lambda (s) (and (car s) (cdr s)))
+                                    (delete-dups
+                                     (append
+                                      (agent-recall--load-sessions-index claude-dir)
+                                      (agent-recall--scan-jsonl-timestamps claude-dir))))
+                                   sessions-cache))))
                          (setq session-id
                                (agent-recall--match-session
                                 transcript-time file all-sessions claude-dir))))

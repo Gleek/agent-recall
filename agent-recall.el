@@ -78,7 +78,7 @@
 (require 'iso8601)
 (require 'json)
 
-(defvar deadgrep-extra-arguments)
+(defvar deadgrep-extra-arguments nil)
 (defvar counsel-rg-base-command)
 (declare-function evil-local-set-key "evil-core" (state key def))
 (declare-function deadgrep "deadgrep" (search-term &optional directory))

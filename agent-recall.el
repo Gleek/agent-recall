@@ -78,7 +78,7 @@
 (require 'iso8601)
 (require 'json)
 
-(defvar deadgrep-extra-arguments nil)
+(defvar deadgrep-extra-arguments)
 (defvar counsel-rg-base-command)
 (declare-function evil-local-set-key "evil-core" (state key def))
 (declare-function deadgrep "deadgrep" (search-term &optional directory))
@@ -519,7 +519,7 @@ DIRS are unused; deadgrep searches the symlink directory instead."
   (unless (fboundp 'deadgrep)
     (user-error "Deadgrep is not installed.  Install it or set `agent-recall-search-function' to `grep'"))
   (let ((dir (agent-recall--ensure-symlink-dir))
-        (deadgrep-extra-arguments (append deadgrep-extra-arguments '("--follow"))))
+        (deadgrep-extra-arguments (append (bound-and-true-p deadgrep-extra-arguments) '("--follow"))))
     (deadgrep query dir)
     (when agent-recall-auto-transcript-mode
       (agent-recall--install-transcript-hook)

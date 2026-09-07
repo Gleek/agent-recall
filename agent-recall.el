@@ -3010,6 +3010,25 @@ Used to detect and discard stale callbacks from timed-out items.")
   ["⠋" "⠙" "⠹" "⠸" "⠼" "⠴" "⠦" "⠧" "⠇" "⠏"]
   "Braille spinner frames for progress indication.")
 
+(defun agent-recall--summarize-handle-agent-error (work-buffer progress-buffer err)
+  "Record agent process error ERR in PROGRESS-BUFFER without tearing down.
+
+acp.el reports every non-empty stderr line from the agent process as an
+error (for example the startup banner printed by wrappers such as
+acp-multiplex), so these are notices, not failures.  A dead process
+surfaces as the pending request's failure, which handles cleanup.
+WORK-BUFFER is left untouched."
+  (ignore work-buffer)
+  (when (buffer-live-p progress-buffer)
+    (with-current-buffer progress-buffer
+      (let ((inhibit-read-only t))
+        (save-excursion
+          (goto-char (point-max))
+          (insert (format "\nAgent notice: %s\n"
+                          (string-trim
+                           (format "%s" (or (alist-get 'message err)
+                                            err))))))))))
+
 (defun agent-recall--summarize-cleanup (work-buffer)
   "Clean up summarization ACP session in WORK-BUFFER."
   (when (buffer-live-p work-buffer)
@@ -3095,6 +3114,7 @@ Uses buffer-local state from WORK-BUFFER to render inline status."
 
 (defun agent-recall--summarize-finalize-line (work-buffer progress-buffer text)
   "Stop spinner, clear inline status, and insert TEXT as the final status.
+WORK-BUFFER owns the spinner and PROGRESS-BUFFER owns the status line.
 TEXT should include a trailing newline to complete the current line."
   (agent-recall--summarize-stop-spinner work-buffer)
   (when (buffer-live-p progress-buffer)
@@ -3318,19 +3338,14 @@ have a summary file are skipped.  Progress is shown in the
                                  (concat agent-recall--summarize-response-text
                                          .content.text)))
                          (agent-recall--summarize-refresh-status work-buffer)))))))))
-          ;; Subscribe to errors
+          ;; Subscribe to errors (agent stderr): log-only, never tear down.
           (acp-subscribe-to-errors
            :client client
            :buffer work-buffer
            :on-error
            (lambda (err)
-             (when (buffer-live-p progress-buffer)
-               (with-current-buffer progress-buffer
-                 (let ((inhibit-read-only t))
-                   (goto-char (point-max))
-                   (insert (format "\nAgent error: %S\n" err)))))
-             (agent-recall--summarize-cleanup work-buffer)
-             (ignore-errors (kill-buffer work-buffer))))
+             (agent-recall--summarize-handle-agent-error
+              work-buffer progress-buffer err)))
           ;; Initialize → New session → Start summarizing
           (acp-send-request
            :client client

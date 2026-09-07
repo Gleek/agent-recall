@@ -55,6 +55,7 @@
 (declare-function agent-recall--navigation-request-abort "agent-recall")
 (declare-function agent-recall--open-transcript "agent-recall")
 (declare-function agent-recall--project-name "agent-recall")
+(declare-function agent-recall--provider-icon "agent-recall")
 (declare-function agent-recall--transcript-file-p "agent-recall")
 (declare-function agent-recall-transcript-mode "agent-recall")
 
@@ -434,6 +435,7 @@ show it after the date column."
          (timestamp (agent-recall-consult--humanize-timestamp
                      (file-name-sans-extension (file-name-nondirectory file))))
          (cand (concat
+                (agent-recall--provider-icon file entry)
                 indicator
                 (propertize (format "[%s]" project) 'face 'consult-file)
                 proj-pad

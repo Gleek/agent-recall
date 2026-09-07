@@ -126,6 +126,21 @@
   "Face for user-assigned session labels in pickers and candidates."
   :group 'agent-recall)
 
+(defface agent-recall-provider-anthropic
+  '((t :foreground "#D97757" :weight bold))
+  "Fallback face for the Anthropic provider indicator on text terminals."
+  :group 'agent-recall)
+
+(defface agent-recall-provider-openai
+  '((t :inherit default :weight bold))
+  "Fallback face for the OpenAI provider indicator on text terminals."
+  :group 'agent-recall)
+
+(defface agent-recall-provider-gemini
+  '((t :foreground "#9B72CB" :weight bold))
+  "Fallback face for the Gemini provider indicator on text terminals."
+  :group 'agent-recall)
+
 (defcustom agent-recall-search-paths nil
   "Root directories to scan when rebuilding the transcript index.
 Used only by `agent-recall-reindex'.  Each directory is recursively
@@ -282,6 +297,31 @@ When set to `ask', prompts before restoring."
   :type '(choice (const :tag "Always" t)
                  (const :tag "Ask each time" ask)
                  (const :tag "Never" nil))
+  :group 'agent-recall)
+
+(defcustom agent-recall-show-provider-icons nil
+  "When non-nil, prefix picker candidates with the AI provider's logo.
+The provider (Anthropic, OpenAI, or Gemini) is derived from each
+transcript's agent/model.  Graphic displays show a real SVG logo; text
+terminals fall back to a colored initial.  After enabling, run
+\\[agent-recall-reindex] so the provider is cached in the index and
+picker building stays fast."
+  :type 'boolean
+  :group 'agent-recall)
+
+(defcustom agent-recall-icon-directory
+  (expand-file-name
+   "icons"
+   (file-name-directory (or load-file-name buffer-file-name default-directory)))
+  "Directory containing provider logo SVG assets (e.g. `openai.svg')."
+  :type 'directory
+  :group 'agent-recall)
+
+(defcustom agent-recall-provider-icon-height nil
+  "Height in pixels for provider logos in pickers.
+When nil, each logo is sized to the default font height."
+  :type '(choice (const :tag "Match font height" nil)
+                 (integer :tag "Pixels"))
   :group 'agent-recall)
 
 (defcustom agent-recall-claude-config-dir
@@ -714,6 +754,7 @@ Extracts a preview from the file content.  Saves the index to disk."
                    :dir (directory-file-name dir)
                    :timestamp basename
                    :session-id session-id
+                   :agent (agent-recall--read-agent-name file)
                    :preview (or preview "(empty)"))
              agent-recall--index)
     (agent-recall--index-save)))
@@ -871,6 +912,70 @@ can concat it unconditionally onto candidate strings."
   (if-let ((label (agent-recall-session-label session-id)))
       (concat "  " (propertize label 'face 'agent-recall-label))
     ""))
+
+(defun agent-recall--provider-for-name (name)
+  "Return a provider symbol (`anthropic', `openai', `gemini') for NAME.
+NAME is an agent name or model id string.  Returns nil when it matches
+no known provider."
+  (when (and name (stringp name))
+    (let ((n (downcase name)))
+      (cond
+       ((string-match-p "claude\\|anthropic" n) 'anthropic)
+       ((string-match-p "codex\\|openai\\|chatgpt\\|gpt\\|\\bo[0-9]" n) 'openai)
+       ((string-match-p "gemini\\|bard\\|palm\\|google" n) 'gemini)))))
+
+(defun agent-recall--entry-provider (file entry)
+  "Return the provider symbol for transcript FILE with index ENTRY, or nil.
+Prefers the cached `:agent' from ENTRY, then the transcript's Agent
+header, then the saved model metadata."
+  (or (agent-recall--provider-for-name (plist-get entry :agent))
+      (agent-recall--provider-for-name (agent-recall--read-agent-name file))
+      (when-let ((sid (plist-get entry :session-id)))
+        (agent-recall--provider-for-name
+         (agent-recall-metadata-get sid 'model)))))
+
+(defvar agent-recall--provider-image-cache (make-hash-table :test 'equal)
+  "Memoized provider SVG image objects, keyed by (PROVIDER HEIGHT FG).")
+
+(defun agent-recall--provider-image (provider)
+  "Return a cached SVG image object for PROVIDER, or nil.
+Nil on non-graphic displays or when SVG or the asset file is
+unavailable.  Monochrome logos (those using `currentColor') are tinted
+to the current default foreground so they track the theme."
+  (when (and provider (display-graphic-p) (image-type-available-p 'svg))
+    (let* ((height (or agent-recall-provider-icon-height (default-font-height)))
+           (fg (or (face-foreground 'default nil t) "#000000"))
+           (key (list provider height fg)))
+      (or (gethash key agent-recall--provider-image-cache)
+          (let ((file (expand-file-name (format "%s.svg" provider)
+                                        agent-recall-icon-directory)))
+            (when (file-readable-p file)
+              (let* ((raw (with-temp-buffer
+                            (insert-file-contents file)
+                            (buffer-string)))
+                     (data (replace-regexp-in-string "currentColor" fg raw t t))
+                     (img (create-image data 'svg t
+                                        :height height :ascent 'center)))
+                (puthash key img agent-recall--provider-image-cache))))))))
+
+(defun agent-recall--provider-icon (file entry)
+  "Return a propertized provider-logo prefix for FILE/ENTRY, or \"\".
+Empty unless `agent-recall-show-provider-icons' is non-nil.  Shows a
+real SVG logo on graphic displays, and a colored initial on text
+terminals."
+  (if (not agent-recall-show-provider-icons)
+      ""
+    (if-let ((provider (agent-recall--entry-provider file entry)))
+        (let ((help (capitalize (symbol-name provider)))
+              (img (agent-recall--provider-image provider)))
+          (if img
+              (concat (propertize " " 'display img 'help-echo help) " ")
+            (let ((face (intern (format "agent-recall-provider-%s"
+                                        (symbol-name provider)))))
+              (concat (propertize (upcase (substring (symbol-name provider) 0 1))
+                                  'face face 'help-echo help)
+                      " "))))
+      "")))
 
 (defun agent-recall--display-timestamp (ts)
   "Format index timestamp TS as a compact date and time.
@@ -1041,6 +1146,7 @@ created outside of agent-shell sessions tracked by the hook."
                            :dir (directory-file-name dir)
                            :timestamp basename
                            :session-id session-id
+                           :agent (agent-recall--read-agent-name file)
                            :preview (or preview "(empty)"))
                      new-index)
             (cl-incf file-count)))))
@@ -1063,6 +1169,7 @@ created outside of agent-shell sessions tracked by the hook."
                                :dir (directory-file-name dir)
                                :timestamp basename
                                :session-id session-id
+                               :agent (agent-recall--read-agent-name file)
                                :preview (or preview "(empty)"))
                          new-index)
                 (cl-incf file-count)))))))
@@ -1440,7 +1547,8 @@ Each entry also carries its timestamp for sorting."
                  (let* ((file (agent-recall--canonical-file file))
                         (project (plist-get entry :project))
                         (ts (plist-get entry :timestamp))
-                        (display (concat (format "[%s] " project)
+                        (display (concat (agent-recall--provider-icon file entry)
+                                         (format "[%s] " project)
                                          (propertize (agent-recall--display-timestamp ts)
                                                      'face 'shadow)
                                          (agent-recall--label-suffix
@@ -1670,7 +1778,8 @@ Like `agent-recall--list-transcripts' but filtered to entries whose
                                    project-down))
                  (let* ((file (agent-recall--canonical-file file))
                         (ts (plist-get entry :timestamp))
-                        (display (concat (format "[%s] " (plist-get entry :project))
+                        (display (concat (agent-recall--provider-icon file entry)
+                                         (format "[%s] " (plist-get entry :project))
                                          (propertize (agent-recall--display-timestamp ts)
                                                      'face 'shadow)
                                          (agent-recall--label-suffix
@@ -2167,7 +2276,8 @@ Only shows transcripts that have resolvable session IDs."
                      (let* ((project (plist-get entry :project))
                             (ts (plist-get entry :timestamp))
                             (preview (or (plist-get entry :preview) ""))
-                            (display (concat (format "[%s] " project)
+                            (display (concat (agent-recall--provider-icon file entry)
+                                             (format "[%s] " project)
                                              (propertize (agent-recall--display-timestamp ts)
                                                          'face 'shadow)
                                              (agent-recall--label-suffix session-id))))

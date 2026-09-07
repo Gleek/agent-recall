@@ -89,9 +89,9 @@
 (declare-function counsel-rg "counsel" (&optional initial-input initial-directory extra-rg-args rg-prompt))
 (defvar consult-ripgrep-args)
 (declare-function consult-ripgrep "consult" (&optional dir initial))
-(declare-function consult--read "consult")
-(declare-function consult--temporary-files "consult")
-(declare-function consult--buffer-preview "consult")
+(declare-function agent-recall-consult--browse-read "agent-recall-consult")
+(declare-function agent-recall-consult--browse-preview-state "agent-recall-consult")
+(declare-function agent-recall-consult--suspend-available-p "agent-recall-consult")
 (declare-function ivy-read "ivy")
 (declare-function ivy-state-current "ivy")
 (declare-function ivy--get-window "ivy")
@@ -101,6 +101,8 @@
 (defvar embark-keymap-alist)
 (declare-function agent-shell-select-config "agent-shell"
                   (&key prompt))
+(declare-function agent-shell--config-option-set-thought-level-id
+                  "agent-shell" (&rest arguments))
 
 ;;;; Customization
 
@@ -172,7 +174,7 @@ alias may still be a string; consumers expect a list of globs."
 Unlike `agent-recall-search-paths' (which scans recursively for
 `.agent-shell/transcripts/' subdirectories), these directories are
 indexed as-is.  Use this for transcripts stored outside the conventional
-layout, e.g. org-mode transcripts from `agent-shell-org-transcript'.
+layout, e.g. `org-mode' transcripts from `agent-shell-org-transcript'.
 
 Each entry is a plist (:dir DIR :project PROJECT) where:
   :dir      - the directory path (required)
@@ -338,6 +340,35 @@ Keys are absolute file paths, values are plists
 (defvar agent-recall--browse-history nil
   "History list for `agent-recall-browse' selections.")
 
+(cl-defstruct
+    (agent-recall--navigation-session
+     (:constructor agent-recall--navigation-session-create))
+  "Origin information for a transcript navigation session."
+  id kind backend minibuffer origin-window selected-file selected-line
+  transcript-buffer origin-buffer origin-marker valid-function
+  resume-function abort-function state)
+
+(defvar agent-recall--navigation-session-counter 0
+  "Monotonic counter used to create navigation session identifiers.")
+
+(defvar agent-recall--navigation-sessions nil
+  "Live transcript navigation sessions, newest first.")
+
+(defvar-local agent-recall--navigation-origins nil
+  "Navigation sessions which can return from the current transcript.")
+
+(defvar-local agent-recall--picker-navigation-session nil
+  "Navigation session owned by the current picker minibuffer.")
+
+(defvar-local agent-recall--search-origin-kind nil
+  "Persistent search backend represented by the current result buffer.")
+
+(defvar agent-recall--pending-search-origin nil
+  "Result buffer origin awaiting a transcript file visit.")
+
+(defvar agent-recall--pending-search-origin-timer nil
+  "Timer which expires `agent-recall--pending-search-origin'.")
+
 (defvar agent-recall--session-id-cache (make-hash-table :test 'equal)
   "Cache mapping transcript file paths to session IDs.
 Values are session ID strings, or the symbol `none' for unresolvable.")
@@ -353,6 +384,280 @@ Values are session ID strings, or the symbol `none' for unresolvable.")
 
 (defvar-local agent-recall--search-buffer-p nil
   "Non-nil in buffers created by agent-recall search commands.")
+
+(defvar agent-recall--navigation-orphan-timer nil
+  "Timer used to abort suspended pickers whose transcript disappeared.")
+
+(defun agent-recall--canonical-file (file)
+  "Return the canonical absolute name of FILE."
+  (when file
+    (condition-case nil
+        (file-truename (expand-file-name file))
+      (file-error (expand-file-name file)))))
+
+(defun agent-recall--summary-parent-file (file)
+  "Return the transcript FILE belongs to.
+Summaries live beside their transcript as TIMESTAMP.summary.EXT, so a
+hit inside one is a hit on TIMESTAMP.EXT.  Non-summary files are
+returned unchanged."
+  (when file
+    (save-match-data
+      (if (string-match "\\.summary\\(\\.[^./]+\\)\\'" file)
+          (concat (substring file 0 (match-beginning 0))
+                  (match-string 1 file))
+        file))))
+
+(defun agent-recall--candidate-key (candidate)
+  "Return the property-free completion identity for CANDIDATE."
+  (and candidate (substring-no-properties candidate)))
+
+(defun agent-recall--candidate-file (candidate)
+  "Return the canonical file payload stored on CANDIDATE."
+  (and candidate (get-text-property 0 'agent-recall-file candidate)))
+
+(defun agent-recall--candidate-line (candidate)
+  "Return the optional line payload stored on CANDIDATE."
+  (and candidate (get-text-property 0 'agent-recall-line candidate)))
+
+(defun agent-recall--candidate-kind (candidate)
+  "Return the origin kind stored on CANDIDATE."
+  (and candidate (get-text-property 0 'agent-recall-origin-kind candidate)))
+
+(defun agent-recall--candidate-identity (file &optional line kind)
+  "Return a stable payload identity for FILE, LINE, and KIND."
+  (format "%s\0%s\0%s"
+          (agent-recall--canonical-file file)
+          (or line "")
+          (or kind "")))
+
+(defun agent-recall--make-candidate (display file &optional line kind)
+  "Make a completion candidate from DISPLAY with FILE, LINE, and KIND payload."
+  (let* ((canonical (agent-recall--canonical-file file))
+         (candidate (copy-sequence display))
+         (props (list 'agent-recall-file canonical
+                      'agent-recall-line line
+                      'agent-recall-origin-kind kind
+                      'agent-recall-identity
+                      (agent-recall--candidate-identity canonical line kind))))
+    (when (> (length candidate) 0)
+      (add-text-properties 0 (length candidate) props candidate))
+    candidate))
+
+(defun agent-recall--disambiguate-candidates (candidates)
+  "Return CANDIDATES with unique raw completion strings.
+Duplicate visible labels receive a canonical path suffix.  Candidate
+payload properties remain authoritative even when a completion UI strips
+other display properties."
+  (let ((counts (make-hash-table :test 'equal))
+        (seen (make-hash-table :test 'equal)))
+    (dolist (candidate candidates)
+      (cl-incf (gethash (agent-recall--candidate-key candidate) counts 0)))
+    (mapcar
+     (lambda (candidate)
+       (let* ((label (agent-recall--candidate-key candidate))
+              (file (agent-recall--candidate-file candidate))
+              (line (agent-recall--candidate-line candidate))
+              (kind (agent-recall--candidate-kind candidate))
+              (base (if (> (gethash label counts 0) 1)
+                        (concat candidate
+                                (propertize
+                                 (format "  <%s%s>"
+                                         (abbreviate-file-name file)
+                                         (if line (format ":%d" line) ""))
+                                 'face 'shadow))
+                      candidate))
+              (raw (agent-recall--candidate-key base))
+              (ordinal (1+ (gethash raw seen 0))))
+         (puthash raw ordinal seen)
+         (when (> ordinal 1)
+           (setq base (concat base
+                              (propertize (format " #%d" ordinal) 'face 'shadow))))
+         (agent-recall--make-candidate base file line kind)))
+     candidates)))
+
+(defun agent-recall--candidate-lookup (candidate candidates)
+  "Return the original CANDIDATE member from CANDIDATES, if present."
+  (and candidate
+       (seq-find (lambda (item)
+                   (equal (agent-recall--candidate-key item)
+                          (agent-recall--candidate-key candidate)))
+                 candidates)))
+
+(cl-defun agent-recall--navigation-new-session
+    (kind backend &key origin-window valid-function resume-function abort-function
+          origin-buffer origin-marker)
+  "Create and register a navigation session of KIND for BACKEND.
+ORIGIN-WINDOW is the picker or result window.  VALID-FUNCTION,
+RESUME-FUNCTION, and ABORT-FUNCTION implement backend operations.
+ORIGIN-BUFFER and ORIGIN-MARKER identify a persistent result location."
+  (let ((session
+         (agent-recall--navigation-session-create
+          :id (format "agent-recall-%d-%d"
+                      (emacs-pid)
+                      (cl-incf agent-recall--navigation-session-counter))
+          :kind kind
+          :backend backend
+          :origin-window origin-window
+          :origin-buffer origin-buffer
+          :origin-marker origin-marker
+          :valid-function valid-function
+          :resume-function resume-function
+          :abort-function abort-function
+          :state 'picker)))
+    (push session agent-recall--navigation-sessions)
+    (add-hook 'delete-frame-functions #'agent-recall--navigation-frame-deleted)
+    session))
+
+(defun agent-recall--navigation-session-valid-p (session)
+  "Return non-nil when SESSION still identifies a usable origin."
+  (and (agent-recall--navigation-session-p session)
+       (not (eq (agent-recall--navigation-session-state session) 'closed))
+       (pcase (agent-recall--navigation-session-backend session)
+         ('suspended
+          (when-let ((valid (agent-recall--navigation-session-valid-function
+                             session)))
+            (condition-case nil
+                (funcall valid session)
+              (error nil))))
+         ('persistent
+          (let ((buffer (agent-recall--navigation-session-origin-buffer session))
+                (marker (agent-recall--navigation-session-origin-marker session)))
+            (and (buffer-live-p buffer)
+                 (markerp marker)
+                 (eq (marker-buffer marker) buffer))))
+         (_ nil))))
+
+(defun agent-recall--navigation-detach (session)
+  "Detach SESSION from its transcript buffer."
+  (when-let ((buffer (agent-recall--navigation-session-transcript-buffer session)))
+    (when (buffer-live-p buffer)
+      (with-current-buffer buffer
+        (setq agent-recall--navigation-origins
+              (delq session agent-recall--navigation-origins))
+        (unless agent-recall--navigation-origins
+          (remove-hook 'kill-buffer-hook
+                       #'agent-recall--navigation-transcript-killed t))))
+    (setf (agent-recall--navigation-session-transcript-buffer session) nil)))
+
+(defun agent-recall--navigation-attach (session buffer)
+  "Attach SESSION as the newest navigation origin in BUFFER."
+  (agent-recall--navigation-detach session)
+  (setf (agent-recall--navigation-session-transcript-buffer session) buffer)
+  (with-current-buffer buffer
+    (setq agent-recall--navigation-origins
+          (cons session (delq session agent-recall--navigation-origins)))
+    (add-hook 'kill-buffer-hook #'agent-recall--navigation-transcript-killed nil t)))
+
+(defun agent-recall--navigation-cleanup (session)
+  "Remove all live references owned by navigation SESSION."
+  (when (agent-recall--navigation-session-p session)
+    (agent-recall--navigation-detach session)
+    (when-let ((minibuffer (agent-recall--navigation-session-minibuffer session)))
+      (when (buffer-live-p minibuffer)
+        (with-current-buffer minibuffer
+          (when (eq agent-recall--picker-navigation-session session)
+            (setq agent-recall--picker-navigation-session nil)))))
+    (when-let ((marker (agent-recall--navigation-session-origin-marker session)))
+      (set-marker marker nil))
+    (setf (agent-recall--navigation-session-state session) 'closed)
+    (setq agent-recall--navigation-sessions
+          (delq session agent-recall--navigation-sessions))
+    (unless agent-recall--navigation-sessions
+      (remove-hook 'delete-frame-functions #'agent-recall--navigation-frame-deleted))
+    (agent-recall--navigation-schedule-orphan-abort)))
+
+(defun agent-recall--navigation-current-origin ()
+  "Return the newest valid navigation origin in the current buffer."
+  (let ((session (car agent-recall--navigation-origins)))
+    (and (agent-recall--navigation-session-valid-p session) session)))
+
+(defun agent-recall--navigation-has-origin-p ()
+  "Return non-nil when the current transcript has a valid return origin."
+  (and (agent-recall--navigation-current-origin) t))
+
+(defun agent-recall--navigation-restore-persistent (session)
+  "Return to the persistent result buffer recorded by SESSION."
+  (let ((buffer (agent-recall--navigation-session-origin-buffer session))
+        (marker (agent-recall--navigation-session-origin-marker session))
+        (window (agent-recall--navigation-session-origin-window session)))
+    (unwind-protect
+        (progn
+          (agent-recall--navigation-detach session)
+          (if (window-live-p window)
+              (progn
+                (select-window window)
+                (set-window-buffer window buffer))
+            (pop-to-buffer buffer))
+          (goto-char marker))
+      (agent-recall--navigation-cleanup session))))
+
+(defun agent-recall--navigation-request-abort (session)
+  "Abort SESSION and clean it up if its backend does not unwind."
+  (agent-recall--navigation-detach session)
+  (condition-case err
+      (if-let ((abort (agent-recall--navigation-session-abort-function session)))
+          (unless (funcall abort session)
+            (agent-recall--navigation-schedule-orphan-abort))
+        (agent-recall--navigation-cleanup session))
+    (error
+     (agent-recall--navigation-cleanup session)
+     (signal (car err) (cdr err)))))
+
+(defun agent-recall--navigation-abort-orphan ()
+  "Abort the newest suspended picker which has lost its transcript."
+  (setq agent-recall--navigation-orphan-timer nil)
+  (when-let ((session
+              (seq-find
+               (lambda (item)
+                 (and (eq (agent-recall--navigation-session-backend item)
+                          'suspended)
+                      (memq (agent-recall--navigation-session-state item)
+                            '(suspended orphaned))
+                      (not (buffer-live-p
+                            (agent-recall--navigation-session-transcript-buffer
+                             item)))))
+               agent-recall--navigation-sessions)))
+    (agent-recall--navigation-request-abort session)))
+
+(defun agent-recall--navigation-schedule-orphan-abort ()
+  "Schedule cleanup of any suspended picker without a transcript."
+  (when (and
+         (seq-some
+          (lambda (item)
+            (and (eq (agent-recall--navigation-session-backend item)
+                     'suspended)
+                 (memq (agent-recall--navigation-session-state item)
+                       '(suspended orphaned))
+                 (not (buffer-live-p
+                       (agent-recall--navigation-session-transcript-buffer
+                        item)))))
+          agent-recall--navigation-sessions)
+         (not (timerp agent-recall--navigation-orphan-timer)))
+    (setq agent-recall--navigation-orphan-timer
+          (run-at-time 0.05 nil #'agent-recall--navigation-abort-orphan))))
+
+(defun agent-recall--navigation-transcript-killed ()
+  "Arrange cleanup when a transcript with navigation origins is killed."
+  (let ((origins agent-recall--navigation-origins))
+    (setq agent-recall--navigation-origins nil)
+    (dolist (session origins)
+      (setf (agent-recall--navigation-session-transcript-buffer session) nil)
+      (if (eq (agent-recall--navigation-session-backend session) 'suspended)
+          (agent-recall--navigation-schedule-orphan-abort)
+        (agent-recall--navigation-cleanup session)))))
+
+(defun agent-recall--navigation-frame-deleted (frame)
+  "Clean navigation sessions whose picker or origin belonged to FRAME."
+  (dolist (session (copy-sequence agent-recall--navigation-sessions))
+    (let ((origin (agent-recall--navigation-session-origin-window session))
+          (minibuffer (agent-recall--navigation-session-minibuffer session)))
+      (when (or (and (windowp origin) (eq (window-frame origin) frame))
+                (and (buffer-live-p minibuffer)
+                     (when-let ((window (get-buffer-window minibuffer t)))
+                       (eq (window-frame window) frame))))
+        (if (eq (agent-recall--navigation-session-backend session) 'suspended)
+            (run-at-time 0 nil #'agent-recall--navigation-request-abort session)
+          (agent-recall--navigation-cleanup session))))))
 
 ;;;; Persistent Index
 
@@ -568,19 +873,28 @@ can concat it unconditionally onto candidate strings."
     ""))
 
 (defun agent-recall--display-timestamp (ts)
-  "Format index timestamp TS (\"2026-08-21-19-33-56\") as \"Aug 21\".
-Timestamps from a year other than the current one include it
-\(\"Aug 21 2025\").  Returns TS unchanged when it doesn't parse."
+  "Format index timestamp TS as a compact date and time.
+For example, \"2026-08-21-19-33-56\" becomes \"Aug 21 19:33:56\".
+Timestamps from another year include that year.  Return TS unchanged
+when it cannot be parsed."
   (let ((parts (split-string (or ts "") "[-T]")))
     (if (< (length parts) 3)
         ts
       (let ((year (string-to-number (nth 0 parts)))
             (month (string-to-number (nth 1 parts)))
-            (day (string-to-number (nth 2 parts))))
+            (day (string-to-number (nth 2 parts)))
+            (hour (string-to-number (or (nth 3 parts) "0")))
+            (minute (string-to-number (or (nth 4 parts) "0")))
+            (second (string-to-number (or (nth 5 parts) "0"))))
         (if (and (<= 1 month 12) (<= 1 day 31) (> year 0))
-            (concat (format-time-string "%b %e" (encode-time 0 0 0 day month year))
-                    (unless (= year (string-to-number (format-time-string "%Y")))
-                      (format " %d" year)))
+            (concat
+             (format-time-string
+              (if (>= (length parts) 6)
+                  "%b %e %H:%M:%S"
+                (if (>= (length parts) 5) "%b %e %H:%M" "%b %e"))
+              (encode-time second minute hour day month year))
+             (unless (= year (string-to-number (format-time-string "%Y")))
+               (format " %d" year)))
           ts)))))
 
 (defun agent-recall--capture-preferences ()
@@ -633,7 +947,7 @@ returns `/path/to/project'."
     (directory-file-name (file-name-directory agent-shell-dir))))
 
 (defun agent-recall--org-file-p (file)
-  "Return non-nil if FILE is an org-mode transcript."
+  "Return non-nil if FILE is an `org-mode' transcript."
   (and file (string-suffix-p ".org" file)))
 
 (defun agent-recall--org-read-property (file property)
@@ -830,16 +1144,81 @@ The directory lives alongside `agent-recall-index-file'."
   (unless (memq #'agent-recall--maybe-enable-from-search find-file-hook)
     (add-hook 'find-file-hook #'agent-recall--maybe-enable-from-search)))
 
+(defun agent-recall--clear-pending-search-origin (&optional token)
+  "Clear the pending result origin when it still matches TOKEN."
+  (when (or (not token)
+            (eq token (plist-get agent-recall--pending-search-origin :token)))
+    (remove-hook 'post-command-hook
+                 #'agent-recall--finish-pending-search-origin)
+    (when (timerp agent-recall--pending-search-origin-timer)
+      (cancel-timer agent-recall--pending-search-origin-timer))
+    (setq agent-recall--pending-search-origin nil
+          agent-recall--pending-search-origin-timer nil)))
+
+(defun agent-recall--prepare-search-origin ()
+  "Record the current persistent result buffer before running a command."
+  (let ((token (cons nil nil)))
+    (agent-recall--clear-pending-search-origin)
+    (setq agent-recall--pending-search-origin
+          (list :token token
+                :kind agent-recall--search-origin-kind
+                :buffer (current-buffer)
+                :marker (copy-marker (point))
+                :window (selected-window)))
+    (add-hook 'post-command-hook
+              #'agent-recall--finish-pending-search-origin)
+    (setq agent-recall--pending-search-origin-timer
+          (run-at-time 0.1 nil
+                       #'agent-recall--clear-pending-search-origin token))))
+
+(defun agent-recall--mark-search-buffer (kind)
+  "Mark the current result buffer as persistent search KIND."
+  (setq-local agent-recall--search-buffer-p t)
+  (setq-local agent-recall--search-origin-kind kind)
+  (add-hook 'pre-command-hook #'agent-recall--prepare-search-origin nil t))
+
 (defun agent-recall--maybe-enable-from-search ()
   "Enable transcript-mode if file is a transcript opened from agent-recall.
-Only activates when `agent-recall-auto-transcript-mode' is non-nil and
-an agent-recall search buffer exists in the current session."
-  (when (and agent-recall-auto-transcript-mode
-             (agent-recall--transcript-file-p (buffer-file-name))
-             (cl-some (lambda (buf)
-                        (buffer-local-value 'agent-recall--search-buffer-p buf))
-                      (buffer-list)))
-    (agent-recall-transcript-mode 1)))
+Only persistent grep and deadgrep result buffers establish this origin."
+  (when (and agent-recall--pending-search-origin
+             agent-recall-auto-transcript-mode
+             (agent-recall--transcript-file-p (buffer-file-name)))
+    (unless (bound-and-true-p agent-recall-transcript-mode)
+      (agent-recall-transcript-mode 1))))
+
+(defun agent-recall--attach-pending-search-origin (origin)
+  "Attach persistent search ORIGIN to the current transcript buffer."
+  (let ((buffer (plist-get origin :buffer))
+        (marker (plist-get origin :marker)))
+    (when (and agent-recall-auto-transcript-mode
+               (agent-recall--transcript-file-p (buffer-file-name))
+               (buffer-live-p buffer)
+               (markerp marker)
+               (eq (marker-buffer marker) buffer)
+               (buffer-local-value 'agent-recall--search-buffer-p buffer))
+      (unless (bound-and-true-p agent-recall-transcript-mode)
+        (agent-recall-transcript-mode 1))
+      (let ((session
+             (agent-recall--navigation-new-session
+              (plist-get origin :kind) 'persistent
+              :origin-window (plist-get origin :window)
+              :origin-buffer buffer
+              :origin-marker marker)))
+        (setf (agent-recall--navigation-session-selected-file session)
+              (agent-recall--canonical-file (buffer-file-name))
+              (agent-recall--navigation-session-selected-line session)
+              (line-number-at-pos)
+              (agent-recall--navigation-session-state session) 'transcript)
+        (agent-recall--navigation-attach session (current-buffer))
+        t))))
+
+(defun agent-recall--finish-pending-search-origin ()
+  "Finish a persistent result command and consume its recorded origin."
+  (when-let ((origin agent-recall--pending-search-origin))
+    (unwind-protect
+        (agent-recall--attach-pending-search-origin origin)
+      (agent-recall--clear-pending-search-origin
+       (plist-get origin :token)))))
 
 (defun agent-recall--search-via-grep (query dirs)
   "Search DIRS for QUERY using grep with results in `grep-mode'.
@@ -855,7 +1234,7 @@ Falls back to standard grep, available on all systems."
       (agent-recall--install-transcript-hook)
       (when-let ((buf (get-buffer "*grep*")))
         (with-current-buffer buf
-          (setq-local agent-recall--search-buffer-p t))))))
+          (agent-recall--mark-search-buffer 'grep))))))
 
 (defun agent-recall--search-via-deadgrep (query _dirs)
   "Search transcripts for QUERY using `deadgrep'.
@@ -867,7 +1246,7 @@ DIRS are unused; deadgrep searches the symlink directory instead."
     (deadgrep query dir)
     (when agent-recall-auto-transcript-mode
       (agent-recall--install-transcript-hook)
-      (setq-local agent-recall--search-buffer-p t))))
+      (agent-recall--mark-search-buffer 'deadgrep))))
 
 (defun agent-recall--search-via-counsel-rg (query _dirs)
   "Search transcripts for QUERY using `counsel-rg'.
@@ -1009,6 +1388,48 @@ otherwise falls back to the best available live backend."
 
 ;;;; Browse
 
+(defun agent-recall--transcript-path-less-p (a b)
+  "Return non-nil when transcript record A has a path before B."
+  (string< (agent-recall--canonical-file (nth 1 a))
+           (agent-recall--canonical-file (nth 1 b))))
+
+(defun agent-recall--transcript-primary-less-p (a b primary direction)
+  "Compare transcript records A and B by PRIMARY in DIRECTION.
+Use the canonical absolute path as a deterministic tie-breaker."
+  (let ((av (funcall primary a))
+        (bv (funcall primary b)))
+    (if (equal av bv)
+        (agent-recall--transcript-path-less-p a b)
+      (funcall direction av bv))))
+
+(defun agent-recall--transcript-mtime (record)
+  "Return the modification time for transcript RECORD."
+  (or (when-let ((attributes (file-attributes (nth 1 record))))
+        (file-attribute-modification-time attributes))
+      (seconds-to-time 0)))
+
+(defun agent-recall--sort-transcript-records (records)
+  "Sort transcript RECORDS according to `agent-recall-browse-sort'."
+  (sort
+   records
+   (lambda (a b)
+     (pcase agent-recall-browse-sort
+       ('date-desc
+        (agent-recall--transcript-primary-less-p a b #'caddr #'string>))
+       ('date-asc
+        (agent-recall--transcript-primary-less-p a b #'caddr #'string<))
+       ('modified-desc
+        (agent-recall--transcript-primary-less-p
+         a b #'agent-recall--transcript-mtime
+         (lambda (left right) (time-less-p right left))))
+       ('modified-asc
+        (agent-recall--transcript-primary-less-p
+         a b #'agent-recall--transcript-mtime #'time-less-p))
+       ('project
+        (agent-recall--transcript-primary-less-p
+         a b (lambda (record) (or (nth 3 record) "")) #'string<))
+       (_ (agent-recall--transcript-path-less-p a b))))))
+
 (defun agent-recall--list-transcripts ()
   "Return an alist of (DISPLAY-NAME . FILE-PATH) for all transcripts.
 Each entry also carries its timestamp for sorting."
@@ -1016,7 +1437,8 @@ Each entry also carries its timestamp for sorting."
   (let ((transcripts '()))
     (maphash (lambda (file entry)
                (when (file-exists-p file)
-                 (let* ((project (plist-get entry :project))
+                 (let* ((file (agent-recall--canonical-file file))
+                        (project (plist-get entry :project))
                         (ts (plist-get entry :timestamp))
                         (display (concat (format "[%s] " project)
                                          (propertize (agent-recall--display-timestamp ts)
@@ -1025,25 +1447,13 @@ Each entry also carries its timestamp for sorting."
                                           (plist-get entry :session-id)))))
                    (push (list display file ts project) transcripts))))
              agent-recall--index)
-    (setq transcripts
-          (pcase agent-recall-browse-sort
-            ('date-desc     (sort transcripts (lambda (a b) (string> (nth 2 a) (nth 2 b)))))
-            ('date-asc      (sort transcripts (lambda (a b) (string< (nth 2 a) (nth 2 b)))))
-            ('modified-desc (sort transcripts (lambda (a b)
-                                                (time-less-p
-                                                 (file-attribute-modification-time (file-attributes (nth 1 b)))
-                                                 (file-attribute-modification-time (file-attributes (nth 1 a)))))))
-            ('modified-asc  (sort transcripts (lambda (a b)
-                                                (time-less-p
-                                                 (file-attribute-modification-time (file-attributes (nth 1 a)))
-                                                 (file-attribute-modification-time (file-attributes (nth 1 b)))))))
-            ('project       (sort transcripts (lambda (a b) (string< (nth 3 a) (nth 3 b)))))))
+    (setq transcripts (agent-recall--sort-transcript-records transcripts))
     (mapcar (lambda (entry) (cons (nth 0 entry) (nth 1 entry))) transcripts)))
 
 (defun agent-recall--transcript-preview (file)
   "Extract a one-line preview from transcript FILE.
 Returns the first user message, truncated.  Supports both markdown
-and org-mode transcript formats."
+and `org-mode' transcript formats."
   (with-temp-buffer
     (insert-file-contents file nil 0 3000)
     (goto-char (point-min))
@@ -1073,64 +1483,45 @@ and org-mode transcript formats."
               "(empty)"))
         "(empty)"))))
 
-(defun agent-recall--candidate-file (candidate)
-  "Extract the file path stored as a text property on CANDIDATE."
-  (get-text-property 0 'agent-recall-file candidate))
-
-(defun agent-recall--open-transcript (file &optional other-window)
-  "Open transcript FILE and enable `agent-recall-transcript-mode' if configured.
-When OTHER-WINDOW is non-nil, open in another window."
+(defun agent-recall--open-transcript (file &optional other-window line force-mode)
+  "Open transcript FILE and optionally move to LINE.
+When OTHER-WINDOW is non-nil, open in another window.  Enable
+`agent-recall-transcript-mode' when configured, or unconditionally when
+FORCE-MODE is non-nil."
   (if other-window
       (find-file-other-window file)
     (find-file file))
   (goto-char (point-min))
-  (when agent-recall-auto-transcript-mode
+  (when line
+    (forward-line (1- (max 1 line))))
+  (when (or force-mode agent-recall-auto-transcript-mode)
     (agent-recall-transcript-mode 1)))
 
 (defun agent-recall--browse-preview-state (file-lookup)
   "Return a consult state function for live preview of transcripts.
-FILE-LOOKUP is a hash table mapping display strings to file paths.
-Uses consult's own preview machinery for buffer display and cleanup."
-  (let ((open (consult--temporary-files))
-        (preview (consult--buffer-preview)))
-    (lambda (action cand)
-      (unless cand
-        (funcall open))
-      (let* ((file (and cand (gethash cand file-lookup)))
-             (buf (and file
-                       (eq action 'preview)
-                       (funcall open file))))
-        (funcall preview action
-                 (and buf (buffer-name buf)))))))
+FILE-LOOKUP maps completion identities to files."
+  (require 'agent-recall-consult)
+  (agent-recall-consult--browse-preview-state file-lookup))
 
 (defun agent-recall--browse-consult (candidates annotate-fn)
-  "Browse transcripts using consult with live preview.
+  "Browse CANDIDATES using Consult with ANNOTATE-FN.
 CANDIDATES is a list of propertized display strings.
-ANNOTATE-FN is the annotation function.
 Returns the selected candidate string, or nil."
-  (let ((file-lookup (make-hash-table :test 'equal)))
-    (dolist (cand candidates)
-      (when-let* ((file (agent-recall--candidate-file cand)))
-        (puthash (substring-no-properties cand) file file-lookup)))
-    (consult--read
-     candidates
-     :prompt "Transcript: "
-     :annotate annotate-fn
-     :state (agent-recall--browse-preview-state file-lookup)
-     :lookup (lambda (selected candidates &rest _)
-               (car (member selected candidates)))
-     :category 'agent-recall-transcript
-     :sort nil
-     :require-match t
-     :default (car agent-recall--browse-history)
-     :history 'agent-recall--browse-history)))
+  (require 'agent-recall-consult)
+  (agent-recall-consult--browse-read candidates annotate-fn))
 
 (defvar agent-recall--ivy-temporary-buffers nil
   "Buffers opened during `agent-recall-browse' ivy preview.")
 
+(defvar agent-recall--active-browse-candidates nil
+  "Candidate snapshot used by the active Browse picker.")
+
 (defun agent-recall--ivy-browse-update-fn ()
   "Preview the current ivy candidate transcript in the window."
-  (let* ((current (ivy-state-current ivy-last))
+  (let* ((current (or (agent-recall--candidate-lookup
+                       (ivy-state-current ivy-last)
+                       agent-recall--active-browse-candidates)
+                      (ivy-state-current ivy-last)))
          (file (agent-recall--candidate-file current)))
     (when file
       (let ((buf (get-file-buffer file)))
@@ -1156,12 +1547,14 @@ Returns the selected candidate string, or nil."
          (cons '(agent-recall-browse . agent-recall--ivy-browse-unwind)
                ivy-unwind-fns-alist)))
     (unwind-protect
-        (ivy-read "Transcript: " candidates
-                  :caller 'agent-recall-browse
-                  :require-match t
-                  :preselect (car agent-recall--browse-history)
-                  :history 'agent-recall--browse-history
-                  :action (lambda (x) x))
+        (let ((selected
+               (ivy-read "Transcript: " candidates
+                         :caller 'agent-recall-browse
+                         :require-match t
+                         :preselect (car agent-recall--browse-history)
+                         :history 'agent-recall--browse-history
+                         :action (lambda (x) x))))
+          (or (agent-recall--candidate-lookup selected candidates) selected))
       (agent-recall--ivy-browse-unwind))))
 
 (defun agent-recall--browse-default (candidates annotate-fn)
@@ -1169,18 +1562,73 @@ Returns the selected candidate string, or nil."
 CANDIDATES is a list of propertized display strings.
 ANNOTATE-FN is the annotation function.
 Returns the selected candidate string, or nil."
-  (completing-read
-   "Transcript: "
-   (lambda (string pred action)
-     (if (eq action 'metadata)
-         `(metadata
-           (category . agent-recall-transcript)
-           (display-sort-function . identity)
-           (cycle-sort-function . identity)
-           (annotation-function . ,annotate-fn))
-       (complete-with-action action candidates string pred)))
-   nil t nil 'agent-recall--browse-history
-   (car agent-recall--browse-history)))
+  (let ((selected
+         (completing-read
+          "Transcript: "
+          (lambda (string pred action)
+            (if (eq action 'metadata)
+                `(metadata
+                  (category . agent-recall-transcript)
+                  (display-sort-function . identity)
+                  (cycle-sort-function . identity)
+                  (annotation-function . ,annotate-fn))
+              (complete-with-action action candidates string pred)))
+          nil t nil 'agent-recall--browse-history
+          (car agent-recall--browse-history))))
+    (or (agent-recall--candidate-lookup selected candidates) selected)))
+
+(defun agent-recall--browse-candidates (transcripts)
+  "Build unique payload-bearing candidates from TRANSCRIPTS."
+  (agent-recall--disambiguate-candidates
+   (mapcar (lambda (entry)
+             (agent-recall--make-candidate
+              (car entry) (cdr entry) nil 'browse))
+           transcripts)))
+
+(defun agent-recall--index-entry-for-file (file)
+  "Return the index entry matching canonical FILE."
+  (or (gethash file agent-recall--index)
+      (let (found)
+        (maphash
+         (lambda (indexed entry)
+           (when (and (not found)
+                      (equal file (agent-recall--canonical-file indexed)))
+             (setq found entry)))
+         agent-recall--index)
+        found)))
+
+(defun agent-recall--browse-annotation-function (candidates)
+  "Return a preview annotation function for CANDIDATES."
+  (lambda (candidate)
+    (when-let* ((original (or (agent-recall--candidate-lookup
+                               candidate candidates)
+                              candidate))
+                (file (agent-recall--candidate-file original))
+                (entry (agent-recall--index-entry-for-file file))
+                (preview (plist-get entry :preview))
+                ((not (string-empty-p preview))))
+      (concat "  " preview))))
+
+(defun agent-recall--consult-picker-available-p ()
+  "Return non-nil when Browse should use the Consult adapter."
+  (and (require 'consult nil t)
+       (require 'agent-recall-consult nil t)
+       (or agent-recall-browse-preview
+           (agent-recall-consult--suspend-available-p))))
+
+(defun agent-recall--read-browse-candidate (candidates)
+  "Read one item from the Browse CANDIDATES snapshot."
+  (let ((agent-recall--active-browse-candidates candidates)
+        (annotate-fn (agent-recall--browse-annotation-function candidates)))
+    (cond
+     ((and agent-recall-browse-preview
+           (bound-and-true-p ivy-mode)
+           (require 'ivy nil t))
+      (agent-recall--browse-ivy candidates annotate-fn))
+     ((agent-recall--consult-picker-available-p)
+      (agent-recall--browse-consult candidates annotate-fn))
+     (t
+      (agent-recall--browse-default candidates annotate-fn)))))
 
 ;;;###autoload
 (defun agent-recall-browse ()
@@ -1193,31 +1641,9 @@ using consult or ivy if available.  Falls back to plain `completing-read'."
   (let* ((transcripts (agent-recall--list-transcripts)))
     (unless transcripts
       (user-error "No transcripts indexed.  Run M-x agent-recall-reindex"))
-    (let* ((candidates
-            (mapcar (lambda (entry)
-                      (propertize (car entry)
-                                  'agent-recall-file (cdr entry)))
-                    transcripts))
-           (annotate-fn (lambda (candidate)
-                          (when-let* ((file (agent-recall--candidate-file candidate))
-                                      (idx-entry (gethash file agent-recall--index))
-                                      (preview (plist-get idx-entry :preview)))
-                            (unless (string-empty-p preview)
-                              (concat "  " preview)))))
-           (selection
-            (cond
-             ((and agent-recall-browse-preview
-                   (bound-and-true-p ivy-mode)
-                   (require 'ivy nil t))
-              (agent-recall--browse-ivy candidates annotate-fn))
-             ((and agent-recall-browse-preview
-                   (require 'consult nil t))
-              (agent-recall--browse-consult candidates annotate-fn))
-             (t
-              (agent-recall--browse-default candidates annotate-fn))))
-           (file (and selection
-                      (or (agent-recall--candidate-file selection)
-                          (cdr (assoc selection transcripts))))))
+    (let* ((candidates (agent-recall--browse-candidates transcripts))
+           (selection (agent-recall--read-browse-candidate candidates))
+           (file (agent-recall--candidate-file selection)))
       (when file
         (agent-recall--open-transcript file)))))
 
@@ -1242,27 +1668,17 @@ Like `agent-recall--list-transcripts' but filtered to entries whose
                (when (and (file-exists-p file)
                           (string= (downcase (or (plist-get entry :project) ""))
                                    project-down))
-                 (let* ((ts (plist-get entry :timestamp))
+                 (let* ((file (agent-recall--canonical-file file))
+                        (ts (plist-get entry :timestamp))
                         (display (concat (format "[%s] " (plist-get entry :project))
                                          (propertize (agent-recall--display-timestamp ts)
                                                      'face 'shadow)
                                          (agent-recall--label-suffix
                                           (plist-get entry :session-id)))))
-                   (push (list display file ts) transcripts))))
+                   (push (list display file ts (plist-get entry :project))
+                         transcripts))))
              agent-recall--index)
-    (setq transcripts
-          (pcase agent-recall-browse-sort
-            ('date-desc     (sort transcripts (lambda (a b) (string> (nth 2 a) (nth 2 b)))))
-            ('date-asc      (sort transcripts (lambda (a b) (string< (nth 2 a) (nth 2 b)))))
-            ('modified-desc (sort transcripts (lambda (a b)
-                                                (time-less-p
-                                                 (file-attribute-modification-time (file-attributes (nth 1 b)))
-                                                 (file-attribute-modification-time (file-attributes (nth 1 a)))))))
-            ('modified-asc  (sort transcripts (lambda (a b)
-                                                (time-less-p
-                                                 (file-attribute-modification-time (file-attributes (nth 1 a)))
-                                                 (file-attribute-modification-time (file-attributes (nth 1 b)))))))
-            ('project       transcripts)))
+    (setq transcripts (agent-recall--sort-transcript-records transcripts))
     (mapcar (lambda (entry) (cons (nth 0 entry) (nth 1 entry))) transcripts)))
 
 ;;;###autoload
@@ -1277,31 +1693,9 @@ as `agent-recall-browse'."
          (transcripts (agent-recall--list-transcripts-for-project project)))
     (unless transcripts
       (user-error "No transcripts found for project \"%s\"" project))
-    (let* ((candidates
-            (mapcar (lambda (entry)
-                      (propertize (car entry)
-                                  'agent-recall-file (cdr entry)))
-                    transcripts))
-           (annotate-fn (lambda (candidate)
-                          (when-let* ((file (agent-recall--candidate-file candidate))
-                                      (idx-entry (gethash file agent-recall--index))
-                                      (preview (plist-get idx-entry :preview)))
-                            (unless (string-empty-p preview)
-                              (concat "  " preview)))))
-           (selection
-            (cond
-             ((and agent-recall-browse-preview
-                   (bound-and-true-p ivy-mode)
-                   (require 'ivy nil t))
-              (agent-recall--browse-ivy candidates annotate-fn))
-             ((and agent-recall-browse-preview
-                   (require 'consult nil t))
-              (agent-recall--browse-consult candidates annotate-fn))
-             (t
-              (agent-recall--browse-default candidates annotate-fn))))
-           (file (and selection
-                      (or (agent-recall--candidate-file selection)
-                          (cdr (assoc selection transcripts))))))
+    (let* ((candidates (agent-recall--browse-candidates transcripts))
+           (selection (agent-recall--read-browse-candidate candidates))
+           (file (agent-recall--candidate-file selection)))
       (when file
         (agent-recall--open-transcript file)))))
 
@@ -1376,10 +1770,44 @@ plain markdown buffer you can render with your preferred method."
       (message "No earlier user messages"))))
 
 (defun agent-recall-browse-from-transcript ()
-  "Quit current transcript and return to `agent-recall-browse'."
+  "Return to this transcript's exact origin, or reopen Browse."
   (interactive)
-  (quit-window)
-  (agent-recall-browse))
+  (let ((session (car agent-recall--navigation-origins)))
+    (cond
+     ((and session (agent-recall--navigation-session-valid-p session))
+      (pcase (agent-recall--navigation-session-backend session)
+        ('suspended
+         (agent-recall--navigation-detach session)
+         (funcall (agent-recall--navigation-session-resume-function session)
+                  session))
+        ('persistent
+         (agent-recall--navigation-restore-persistent session))))
+     (t
+      (when session
+        (agent-recall--navigation-detach session)
+        (if (eq (agent-recall--navigation-session-backend session) 'suspended)
+            (agent-recall--navigation-schedule-orphan-abort)
+          (agent-recall--navigation-cleanup session)))
+      (quit-window)
+      (agent-recall-browse)))))
+
+(defun agent-recall-quit-transcript ()
+  "Close the transcript and cleanly abort any suspended picker."
+  (interactive)
+  (let ((session (car agent-recall--navigation-origins)))
+    (cond
+     ((and session
+           (eq (agent-recall--navigation-session-backend session) 'suspended)
+           (agent-recall--navigation-session-valid-p session))
+     (agent-recall--navigation-request-abort session))
+     (t
+      (when session
+        (if (eq (agent-recall--navigation-session-backend session) 'suspended)
+            (progn
+              (agent-recall--navigation-detach session)
+              (agent-recall--navigation-schedule-orphan-abort))
+          (agent-recall--navigation-cleanup session)))
+      (quit-window)))))
 
 (defvar agent-recall-transcript-mode-map
   (let ((map (make-sparse-keymap)))
@@ -1387,6 +1815,7 @@ plain markdown buffer you can render with your preferred method."
     (define-key map (kbd "R") #'agent-recall-force-resume-current)
     (define-key map (kbd "c") #'agent-recall-clean-view)
     (define-key map (kbd "b") #'agent-recall-browse-from-transcript)
+    (define-key map (kbd "q") #'agent-recall-quit-transcript)
     (define-key map (kbd "C-c C-n") #'agent-recall-next-user-message)
     (define-key map (kbd "C-c C-p") #'agent-recall-prev-user-message)
     map)
@@ -1413,7 +1842,7 @@ When SESSION-ID is non-nil, include a resume entry."
       (when existing
         (push (agent-recall--header-entry "R" "Force Resume") entries)))
     (push (agent-recall--header-entry "c" "Clean") entries)
-    (push (agent-recall--header-entry "b" "Browse") entries)
+    (push (agent-recall--header-entry "b" "Back") entries)
     (push (agent-recall--header-entry "C-j/C-k" "Navigate") entries)
     (push (agent-recall--header-entry "q" "Quit") entries)
     (concat "  " (mapconcat #'identity (nreverse entries) "  "))))
@@ -1458,6 +1887,8 @@ a summary is shown in the echo area."
                                   (agent-recall-metadata session-id))))
           (message "metadata detected — %s"
                    (agent-recall--metadata-summary metadata))))
+    (when agent-recall--navigation-origins
+      (agent-recall--navigation-transcript-killed))
     (read-only-mode -1)
     (kill-local-variable 'agent-recall--transcript-session-id)
     (kill-local-variable 'header-line-format)))
@@ -1538,7 +1969,7 @@ Window placement for the non-viewport path is controlled by
 
 (defun agent-recall--read-working-directory (file)
   "Extract the Working Directory from transcript FILE header.
-Supports both markdown and org-mode transcript formats."
+Supports both markdown and `org-mode' transcript formats."
   (when (file-exists-p file)
     (with-temp-buffer
       (insert-file-contents file nil 0 500)
@@ -2374,7 +2805,7 @@ Given `TIMESTAMP.md', returns `TIMESTAMP.summary.md' in the same directory."
   (not (file-exists-p (agent-recall--summary-file file))))
 
 (defun agent-recall--clean-transcript-string (file)
-  "Return the content of transcript FILE with tool calls stripped.
+  "Return transcript FILE content without tool-call sections.
 Extracts only the header plus User and Agent sections, removing
 tool calls and agent thought blocks."
   (with-temp-buffer

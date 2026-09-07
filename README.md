@@ -29,6 +29,7 @@ Features:
 
 - **agent-shell** — required for session resume and automatic session tracking. Search and browse work without it.
 - **ripgrep** (optional) — needed for the deadgrep, counsel-rg, and consult-ripgrep search backends. The default grep backend uses standard grep and requires no extra installation.
+- **Consult + Vertico** (optional) — enable live previews and persistent picker navigation. The suspension path is tested with Consult 3.6 and Vertico 2.10 and is detected at runtime; neither package is a hard dependency.
 
 ### Installation
 
@@ -207,17 +208,31 @@ To automatically embed session IDs in new transcripts (enabling instant resume):
 
 `M-x agent-recall-search-live` opens a live-filtering search. It auto-selects the best available backend (`counsel-rg` or `consult-ripgrep`); falls back to a one-shot search if neither is installed.
 
-`M-x agent-recall-consult-search` provides a richer Consult interface when `consult` and `ripgrep` are installed. It groups matches by transcript and shows candidates in `[project] [match-count] date first-match` format, then jumps to the first match in the selected transcript.
+`M-x agent-recall-consult-search` provides a richer Consult interface when `consult` and `ripgrep` are installed. It groups matches by transcript and shows candidates in `[project] [match-count] date first-match` format, then jumps to the first match in the selected transcript. With Vertico's `vertico-suspend` extension available, `RET` visits a result without closing the search; `b` returns to the exact query, result, and matched line.
+
+Transcripts visited from Agent Recall's grep and deadgrep result buffers also remember their exact result buffer and point; press `b` to return there.
 
 ### Browsing transcripts
 
-`M-x agent-recall-browse` shows a completion list of all transcripts in `[project] timestamp` format with preview annotations. Selecting a transcript opens it in `agent-recall-transcript-mode`.
+`M-x agent-recall-browse` shows a completion list of all transcripts in `[project] timestamp` format with preview annotations. Timestamps include the time of day, and genuinely duplicate labels gain a path suffix so every choice remains unambiguous.
 
 When `agent-recall-browse-preview` is non-nil (the default), browse provides live preview of transcripts as you navigate candidates:
 
 - **consult** users get preview via `consult--read` (vertico ecosystem)
 - **ivy/counsel** users get preview via `ivy-read` with `:update-fn` (ivy ecosystem)
 - Without either, falls back to plain `completing-read`
+
+When Consult, Vertico, and `vertico-suspend` are available, Browse preserves the live picker automatically. This still works when `agent-recall-browse-preview` is nil; that option controls preview only.
+
+| Key | Action |
+|-----|--------|
+| `RET` | Visit the highlighted transcript while keeping the exact picker alive |
+| `M-RET` | Accept normally, close the picker, and keep the transcript open |
+| `C-g` | Abort the picker and restore the pre-picker window state |
+
+Press `b` in the visited transcript to return to the same input, candidate order, selected item, viewport, and preview. The candidate list is a snapshot: edits do not reorder it, and newly created transcripts appear the next time Browse is opened. Press `q` to close the transcript and abort its suspended picker cleanly.
+
+If Consult, Vertico, `vertico-suspend`, or automatic transcript mode is unavailable, Browse retains its one-shot behavior and transcript `b` opens a fresh picker. If a recorded picker later becomes stale, `b` safely discards that link and falls back to a fresh Browse picker.
 
 #### Embark integration
 
@@ -339,10 +354,10 @@ In `agent-recall-transcript-mode`:
 | `r` | Resume session — switches to existing buffer if already running |
 | `R` | Force resume — always starts a new agent-shell buffer |
 | `c` | Open clean view (strip tool calls) |
-| `b` | Return to browse list |
+| `b` | Return to the exact picker/result origin, or open a fresh Browse picker |
 | `C-c C-n` | Jump to next user message |
 | `C-c C-p` | Jump to previous user message |
-| `q` | Quit window (evil) |
+| `q` | Close the transcript and abort any suspended picker |
 
 #### Evil
 
@@ -356,7 +371,7 @@ Evil users get additional bindings in normal state:
 | `gk` | Previous user message |
 | `C-j` | Next user message |
 | `C-k` | Previous user message |
-| `q` | Quit window |
+| `q` | Close the transcript and abort any suspended picker |
 
 ## Customizations
 

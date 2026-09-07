@@ -2019,10 +2019,15 @@ and files in `agent-recall-extra-transcript-dirs'."
            (and agent-recall--symlink-dir
                 (string-prefix-p (expand-file-name agent-recall--symlink-dir)
                                  (expand-file-name file)))
+           ;; Compare truenames: with `find-file-visit-truename' the buffer
+           ;; file is fully resolved (e.g. /private/var on macOS) while the
+           ;; configured dir usually is not, and a plain prefix test misses.
            (cl-some (lambda (entry)
                       (let ((dir (file-name-as-directory
-                                  (expand-file-name (plist-get entry :dir)))))
-                        (string-prefix-p dir (expand-file-name file))))
+                                  (file-truename
+                                   (expand-file-name (plist-get entry :dir))))))
+                        (string-prefix-p dir (file-truename
+                                              (expand-file-name file)))))
                     agent-recall-extra-transcript-dirs))))
 
 (defun agent-recall--maybe-enable-transcript-mode ()

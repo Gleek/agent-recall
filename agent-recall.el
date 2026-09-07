@@ -84,7 +84,7 @@
 
 (defvar deadgrep-extra-arguments)
 (defvar counsel-rg-base-command)
-(declare-function evil-local-set-key "evil-core" (state key def))
+(declare-function evil-define-key* "evil-core" (state keymap key def &rest bindings))
 (declare-function deadgrep "deadgrep" (search-term &optional directory))
 (declare-function counsel-rg "counsel" (&optional initial-input initial-directory extra-rg-args rg-prompt))
 (defvar consult-ripgrep-args)
@@ -1930,6 +1930,27 @@ plain markdown buffer you can render with your preferred method."
     map)
   "Keymap for `agent-recall-transcript-mode'.")
 
+;; Evil users get normal-state keys on the minor-mode map itself.  This
+;; must not use `evil-local-set-key' inside the mode body: when the mode
+;; is enabled by `global-agent-recall-transcript-mode' it runs from
+;; `after-change-major-mode-hook' ahead of evil's own enable-in-buffer
+;; hook, so evil's buffer-local maps do not exist yet and the error
+;; aborts the hook chain (leaving the buffer without evil, in
+;; `fundamental-mode').  Binding on the mode map is order-independent.
+(with-eval-after-load 'evil
+  (evil-define-key* 'normal agent-recall-transcript-mode-map
+    (kbd "r") #'agent-recall-resume-current
+    (kbd "R") #'agent-recall-force-resume-current
+    (kbd "c") #'agent-recall-clean-view
+    (kbd "C-j") #'agent-recall-next-user-message
+    (kbd "C-k") #'agent-recall-prev-user-message
+    (kbd "]]") #'agent-recall-next-user-message
+    (kbd "[[") #'agent-recall-prev-user-message
+    (kbd "gj") #'agent-recall-next-user-message
+    (kbd "gk") #'agent-recall-prev-user-message
+    (kbd "b") #'agent-recall-browse-from-transcript
+    (kbd "q") #'agent-recall-quit-transcript))
+
 (defun agent-recall--header-entry (key label)
   "Format a header line entry with KEY highlighted and LABEL dimmed."
   (concat (propertize key 'face 'agent-recall-header-key)
@@ -1977,19 +1998,6 @@ a summary is shown in the echo area."
       (let ((session-id (agent-recall--resolve-session-id (buffer-file-name))))
         (setq-local agent-recall--transcript-session-id session-id)
         (read-only-mode 1)
-        ;; Evil-compatible keybinding
-        (when (bound-and-true-p evil-mode)
-          (evil-local-set-key 'normal (kbd "r") #'agent-recall-resume-current)
-          (evil-local-set-key 'normal (kbd "R") #'agent-recall-force-resume-current)
-          (evil-local-set-key 'normal (kbd "c") #'agent-recall-clean-view)
-          (evil-local-set-key 'normal (kbd "C-j") #'agent-recall-next-user-message)
-          (evil-local-set-key 'normal (kbd "C-k") #'agent-recall-prev-user-message)
-          (evil-local-set-key 'normal (kbd "]]") #'agent-recall-next-user-message)
-          (evil-local-set-key 'normal (kbd "[[") #'agent-recall-prev-user-message)
-          (evil-local-set-key 'normal (kbd "gj") #'agent-recall-next-user-message)
-          (evil-local-set-key 'normal (kbd "gk") #'agent-recall-prev-user-message)
-          (evil-local-set-key 'normal (kbd "b") #'agent-recall-browse-from-transcript)
-          (evil-local-set-key 'normal (kbd "q") #'quit-window))
         (setq-local header-line-format
                     '(:eval (agent-recall--header-line agent-recall--transcript-session-id)))
         (when-let ((metadata (and session-id
